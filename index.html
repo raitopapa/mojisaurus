@@ -1,0 +1,1381 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#8fd0ff">
+<title>もじざうるす</title>
+<style>
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; overflow:hidden; background:#dff4ff;
+    font-family:'Baloo 2','Hiragino Maru Gothic ProN','Yu Gothic UI','M PLUS Rounded 1c',sans-serif;
+    -webkit-tap-highlight-color:transparent; -webkit-user-select:none; user-select:none;
+    overscroll-behavior:none; touch-action:none; }
+  #stage{ position:fixed; inset:0; background:linear-gradient(180deg,#8fd0ff,#dff4ff); }
+  #game{ display:block; width:100%; height:100%; touch-action:none; }
+  .topbtns{ position:absolute; top:max(10px,env(safe-area-inset-top)); right:max(10px,env(safe-area-inset-right));
+    display:flex; gap:10px; z-index:6; }
+  .iconbtn{ width:52px; height:52px; border-radius:16px; border:none; cursor:pointer;
+    background:rgba(255,255,255,.72); color:#2b3a67; font-size:24px; font-weight:800; line-height:1;
+    box-shadow:0 3px 10px rgba(0,0,0,.2); backdrop-filter:blur(4px);
+    display:flex; align-items:center; justify-content:center; touch-action:manipulation;
+    -webkit-user-select:none; user-select:none; }
+  .iconbtn:active{ transform:translateY(1px) scale(.96); }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="game"></canvas>
+    <div class="topbtns">
+      <button class="iconbtn" id="muteBtn" title="おと" aria-label="おと" aria-pressed="false">&#128266;</button>
+      <button class="iconbtn" id="fsBtn" title="ぜんめん" aria-label="ぜんめん">&#9974;</button>
+    </div>
+  </div>
+<script>
+(()=>{'use strict';
+
+/* ===== core/constants.js ===== */
+// core/constants.js — 純粋データ（物理・寸法・配色・保存キー）。他モジュール依存なし。
+// Bramble系の規約に合わせ、export は末尾に1つだけ置く（build.mjs が行頭 import/export を除去）。
+
+const STEP = 1 / 60;            // 固定タイムステップ（loop）
+const BASE_W = 960;             // 内部座標の基準幅（16:9 目安、resize でスケール）
+const BASE_H = 540;             // 内部座標の基準高さ
+
+const SAVE_KEY = 'mojisaurus.save.v1';
+const SAVE_VERSION = 1;
+
+const VOICE_RATE = 0.95;        // TTS 読み上げ速度（仕様§8.5）
+const STARS_PER_EGG = 22;       // たまご孵化に必要な星（仕様§10目安・home/lesson共有）
+
+// シーン名（scene-manager のキー）。文字列直書きの散逸を防ぐ。
+const SCENE = {
+  TITLE: 'title', HOME: 'home', LESSON: 'lesson', GAME_SELECT: 'game_select',
+  REWARD: 'reward', ZUKAN: 'zukan', PARENT: 'parent',
+};
+
+// 明るくポップな「もじのしま」パレット（怖い/暗い配色は避ける・仕様§2）
+const COLORS = {
+  skyTop: '#8fd0ff', skyBot: '#dff4ff',
+  grass: '#74d06e', grassDark: '#4bb04a',
+  sand: '#ffe3ad', sandDark: '#f4c877',
+  ink: '#2b3a67',            // 文字・輪郭（黒でなく深い青）
+  accent: '#ffc53a',         // アクセント（金）
+  white: '#ffffff',
+  // ホームの学習ボタン色（陽気に色分け）
+  btnKaku: '#ff8a5c', btnKotoba: '#57c06a', btnKatakana: '#b58cff',
+  btnZukan: '#5cc8ff', btnParent: '#c9b191',
+  gao: '#7fd47a', gaoDark: '#4fae55', gaoBelly: '#eafbe6',
+};
+
+/* ===== core/utils.js ===== */
+// core/utils.js — 純粋関数のみ（副作用なし）。ctx を要する描画ヘルパは canvas.js 側。
+
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a = 1, b) => b === undefined ? Math.random() * a : a + Math.random() * (b - a);
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+const choice = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+
+// 決定的乱数（種つき）。出題の再現・テストに使う。
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 矩形の内側判定（タップのヒットテスト用・内部座標）
+const pointInRect = (px, py, r) => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+
+/* ===== core/svg-path.js ===== */
+// core/svg-path.js — 依存ゼロの軽量SVGパス(d属性)パーサ＆等間隔サンプラ。
+// DOMのSVG要素やgetPointAtLengthに依存しない自前実装＝ブラウザ/Node(テスト)で同一動作。
+// 対応コマンド: M/m L/l C/c Q/q Z/z（KanjiVG由来のなぞりデータに十分な範囲）。
+
+function parsePathD(d) {
+  const toks = String(d).match(/[MLCQZmlcqz]|-?\d*\.\d+(?:e-?\d+)?|-?\d+(?:e-?\d+)?/g) || [];
+  const commands = [];
+  let i = 0, cmd = null;
+  const nums = (n) => { const out = []; for (let k = 0; k < n; k++) out.push(parseFloat(toks[i++])); return out; };
+  while (i < toks.length) {
+    if (/^[MLCQZmlcqz]$/.test(toks[i])) { cmd = toks[i]; i++; }
+    if (cmd == null) { i++; continue; }
+    switch (cmd) {
+      case 'M': case 'm': { const [x, y] = nums(2); commands.push({ t: 'M', x, y, rel: cmd === 'm' }); cmd = (cmd === 'M') ? 'L' : 'l'; break; }
+      case 'L': case 'l': { const [x, y] = nums(2); commands.push({ t: 'L', x, y, rel: cmd === 'l' }); break; }
+      case 'C': case 'c': { const [x1, y1, x2, y2, x, y] = nums(6); commands.push({ t: 'C', x1, y1, x2, y2, x, y, rel: cmd === 'c' }); break; }
+      case 'Q': case 'q': { const [x1, y1, x, y] = nums(4); commands.push({ t: 'Q', x1, y1, x, y, rel: cmd === 'q' }); break; }
+      case 'Z': case 'z': { commands.push({ t: 'Z' }); break; }
+      default: i++;
+    }
+  }
+  return commands;
+}
+
+// 三次/二次ベジェを線分列へ分割し、稠密なポリラインにする。
+function flattenCommands(commands, segments = 24) {
+  const pts = []; let cx = 0, cy = 0, sx = 0, sy = 0;
+  const push = (x, y) => pts.push({ x, y });
+  for (const c of commands) {
+    if (c.t === 'M') { const x = c.rel ? cx + c.x : c.x, y = c.rel ? cy + c.y : c.y; cx = x; cy = y; sx = x; sy = y; push(x, y); }
+    else if (c.t === 'L') { const x = c.rel ? cx + c.x : c.x, y = c.rel ? cy + c.y : c.y; push(x, y); cx = x; cy = y; }
+    else if (c.t === 'C') {
+      const x1 = c.rel ? cx + c.x1 : c.x1, y1 = c.rel ? cy + c.y1 : c.y1;
+      const x2 = c.rel ? cx + c.x2 : c.x2, y2 = c.rel ? cy + c.y2 : c.y2;
+      const x = c.rel ? cx + c.x : c.x, y = c.rel ? cy + c.y : c.y;
+      for (let s = 1; s <= segments; s++) {
+        const t = s / segments, mt = 1 - t;
+        push(mt * mt * mt * cx + 3 * mt * mt * t * x1 + 3 * mt * t * t * x2 + t * t * t * x,
+             mt * mt * mt * cy + 3 * mt * mt * t * y1 + 3 * mt * t * t * y2 + t * t * t * y);
+      }
+      cx = x; cy = y;
+    } else if (c.t === 'Q') {
+      const x1 = c.rel ? cx + c.x1 : c.x1, y1 = c.rel ? cy + c.y1 : c.y1;
+      const x = c.rel ? cx + c.x : c.x, y = c.rel ? cy + c.y : c.y;
+      for (let s = 1; s <= segments; s++) {
+        const t = s / segments, mt = 1 - t;
+        push(mt * mt * cx + 2 * mt * t * x1 + t * t * x, mt * mt * cy + 2 * mt * t * y1 + t * t * y);
+      }
+      cx = x; cy = y;
+    } else if (c.t === 'Z') { push(sx, sy); cx = sx; cy = sy; }
+  }
+  return pts;
+}
+
+function withLengths(pts) {
+  const acc = [0];
+  for (let i = 1; i < pts.length; i++) acc.push(acc[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  return { pts, acc, total: acc[acc.length - 1] || 0 };
+}
+
+function pointAtLength(poly, len) {
+  const { pts, acc, total } = poly;
+  if (!pts.length) return { x: 0, y: 0 };
+  if (total <= 0) return { x: pts[0].x, y: pts[0].y };
+  len = Math.max(0, Math.min(total, len));
+  let i = 1; while (i < acc.length && acc[i] < len) i++;
+  const i0 = Math.max(0, i - 1), i1 = Math.min(pts.length - 1, i);
+  const segLen = acc[i1] - acc[i0] || 1, t = (len - acc[i0]) / segLen;
+  return { x: pts[i0].x + (pts[i1].x - pts[i0].x) * t, y: pts[i0].y + (pts[i1].y - pts[i0].y) * t };
+}
+
+// d文字列 → { points, length, poly } を返す。points は約 spacing px 間隔の等間隔点列（なぞり判定用）。
+function samplePath(d, spacing = 8, curveSegments = 24) {
+  const poly = withLengths(flattenCommands(parsePathD(d), curveSegments));
+  const n = Math.max(2, Math.round(poly.total / spacing));
+  const points = []; for (let i = 0; i <= n; i++) points.push(pointAtLength(poly, (i / n) * poly.total));
+  return { points, length: poly.total, poly };
+}
+
+function parseViewBox(vb, fallback = 100) {
+  const m = String(vb || '').trim().split(/\s+/).map(Number);
+  if (m.length === 4 && m.every(n => !isNaN(n))) return { w: m[2], h: m[3] };
+  return { w: fallback, h: fallback };
+}
+
+/* ===== core/canvas.js ===== */
+// core/canvas.js — Canvas と ctx の保持、リサイズ、client→内部座標変換、共通描画ヘルパ。
+// 内部座標 = CSS px（等倍）。ctx を dpr スケールして描画は常に CSS px で行う＝タップずれ防止（仕様§13）。
+
+const FONT = "'Baloo 2','Hiragino Maru Gothic ProN','Yu Gothic UI','M PLUS Rounded 1c',sans-serif";
+
+const canvasEl = document.getElementById('game');
+const ctx = canvasEl.getContext('2d');
+const stageEl = document.getElementById('stage') || (canvasEl.parentElement || canvasEl);
+
+const view = { w: 960, h: 540, dpr: 1 };
+
+function resize() {
+  const cssW = stageEl.clientWidth || canvasEl.clientWidth || 960;
+  const cssH = stageEl.clientHeight || canvasEl.clientHeight || 540;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvasEl.width = Math.max(1, Math.round(cssW * dpr));
+  canvasEl.height = Math.max(1, Math.round(cssH * dpr));
+  view.w = cssW; view.h = cssH; view.dpr = dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // 以降 CSS px で描ける
+  ctx.imageSmoothingEnabled = true;
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+if (window.ResizeObserver) { try { new ResizeObserver(resize).observe(stageEl); } catch (_) {} }
+
+// client 座標 → 内部座標（CSS px）。rect と view のズレも吸収。
+function toInternal(clientX, clientY) {
+  const r = canvasEl.getBoundingClientRect();
+  const sx = view.w / (r.width || view.w || 1);
+  const sy = view.h / (r.height || view.h || 1);
+  return { x: (clientX - r.left) * sx, y: (clientY - r.top) * sy };
+}
+
+// ---- 描画ヘルパ ----
+function rrPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function label(txt, x, y, o = {}) {
+  ctx.save();
+  ctx.font = `${o.weight || 800} ${o.size || 28}px ${FONT}`;
+  ctx.textAlign = o.align || 'center';
+  ctx.textBaseline = o.baseline || 'middle';
+  if (o.shadow) { ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillText(txt, x + (o.shadow), y + (o.shadow)); }
+  ctx.fillStyle = o.color || COLORS.ink;
+  ctx.fillText(txt, x, y);
+  ctx.restore();
+}
+
+// ふんわり角丸ボタン（押下時 pressed で少し沈む）
+function pill(rect, o = {}) {
+  const p = o.pressed ? 3 : 0;
+  const x = rect.x, y = rect.y + p, w = rect.w, h = rect.h, r = o.radius ?? Math.min(w, h) * 0.32;
+  ctx.save();
+  if (!o.pressed) { ctx.fillStyle = 'rgba(0,0,0,0.16)'; rrPath(x, y + 6, w, h, r); ctx.fill(); }
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, o.top || '#ffffff'); g.addColorStop(1, o.fill || '#dddddd');
+  ctx.fillStyle = g; rrPath(x, y, w, h, r); ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.65)'; rrPath(x + 2, y + 2, w - 4, h - 4, r - 2); ctx.stroke();
+  ctx.restore();
+  if (o.label) label(o.label, x + w / 2, y + h / 2, { size: o.labelSize || 30, color: o.labelColor || '#ffffff', shadow: 1.5 });
+}
+
+// 背景（空→地面）。もじのしまの明るい配色。
+function fillBg() {
+  const g = ctx.createLinearGradient(0, 0, 0, view.h);
+  g.addColorStop(0, COLORS.skyTop); g.addColorStop(1, COLORS.skyBot);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, view.w, view.h);
+  const gh = Math.min(view.h * 0.22, 150), gy = view.h - gh;
+  const gg = ctx.createLinearGradient(0, gy, 0, view.h);
+  gg.addColorStop(0, COLORS.grass); gg.addColorStop(1, COLORS.grassDark);
+  ctx.fillStyle = gg; ctx.fillRect(0, gy, view.w, gh);
+}
+
+// ナビキャラ「ガオ」の暫定描画（差し替え可・本デザインはアセット/ui でBatch2）
+function drawGao(x, y, size, mood = 'normal') {
+  const s = size;
+  ctx.save();
+  // からだ
+  const bg = ctx.createRadialGradient(x, y - s * 0.15, s * 0.2, x, y, s);
+  bg.addColorStop(0, COLORS.gao); bg.addColorStop(1, COLORS.gaoDark);
+  ctx.fillStyle = bg; ctx.beginPath(); ctx.ellipse(x, y, s * 0.9, s, 0, 0, Math.PI * 2); ctx.fill();
+  // せなかのトゲ（三角3つ）
+  ctx.fillStyle = COLORS.gaoDark;
+  for (let i = -1; i <= 1; i++) { ctx.beginPath(); const bx = x + i * s * 0.42, by = y - s * 0.86; ctx.moveTo(bx - s * 0.14, by + s * 0.16); ctx.lineTo(bx, by - s * 0.18); ctx.lineTo(bx + s * 0.14, by + s * 0.16); ctx.closePath(); ctx.fill(); }
+  // おなか
+  ctx.fillStyle = COLORS.gaoBelly; ctx.beginPath(); ctx.ellipse(x, y + s * 0.2, s * 0.5, s * 0.55, 0, 0, Math.PI * 2); ctx.fill();
+  // め
+  const eo = mood === 'cheer' ? s * 0.06 : 0;
+  for (const dx of [-1, 1]) {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(x + dx * s * 0.34, y - s * 0.3, s * 0.2, s * 0.24, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = COLORS.ink; ctx.beginPath(); ctx.ellipse(x + dx * s * 0.34, y - s * 0.26 - eo, s * 0.1, s * 0.12, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  // ほっぺ
+  ctx.fillStyle = 'rgba(255,120,120,0.5)';
+  for (const dx of [-1, 1]) { ctx.beginPath(); ctx.ellipse(x + dx * s * 0.55, y - s * 0.05, s * 0.13, s * 0.09, 0, 0, Math.PI * 2); ctx.fill(); }
+  // くち（にっこり）
+  ctx.strokeStyle = COLORS.ink; ctx.lineWidth = Math.max(2, s * 0.045); ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (mood === 'happy' || mood === 'cheer') ctx.arc(x, y - s * 0.02, s * 0.22, 0.15 * Math.PI, 0.85 * Math.PI);
+  else ctx.arc(x, y + s * 0.02, s * 0.16, 0.2 * Math.PI, 0.8 * Math.PI);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* ===== core/audio.js ===== */
+// core/audio.js — Web Audio による効果音・音声アンロック。外部依存なし・自己完結（dash と同型）。
+// 音声アンロック：iOS/Safari は初回ユーザー操作まで音が出ない。initAudioOnce() を最初のタップで呼ぶ。
+
+let AC = null, master = null, sfxGain = null, audioReady = false, muted = false, sfxVolume = 0.8;
+
+function initAudioOnce() {
+  if (audioReady) { if (AC && AC.state === 'suspended') AC.resume(); return; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  master = AC.createGain(); master.gain.value = muted ? 0 : 0.9; master.connect(AC.destination);
+  sfxGain = AC.createGain(); sfxGain.gain.value = sfxVolume; sfxGain.connect(master);
+  audioReady = true;
+  // 無音を一発鳴らしてアンロックを確実に
+  try { const b = AC.createBufferSource(); b.buffer = AC.createBuffer(1, 1, AC.sampleRate); b.connect(master); b.start(0); } catch (_) {}
+}
+
+function blip(o) {
+  if (!audioReady) return;
+  const t0 = AC.currentTime + (o.when || 0), dur = o.dur || 0.1;
+  const osc = AC.createOscillator(), g = AC.createGain();
+  osc.type = o.type || 'square';
+  osc.frequency.setValueAtTime(o.f0 || 440, t0);
+  if (o.f1 && o.f1 !== o.f0) osc.frequency.exponentialRampToValueAtTime(Math.max(1, o.f1), t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(o.vol || 0.3, t0 + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g); g.connect(sfxGain); osc.start(t0); osc.stop(t0 + dur + 0.03);
+}
+function seq(notes, type, vol) { let w = 0; for (const n of notes) { blip({ type: type || 'square', f0: n[0], f1: n[0], dur: n[1] * 0.92, vol: vol || 0.26, when: w }); w += n[1]; } }
+
+// 共通演出音（仕様§4）
+const sfxTap = () => blip({ type: 'square', f0: 520, f1: 660, dur: 0.07, vol: 0.18 });     // ボタン
+const sfxCorrect = () => seq([[784, 0.09], [1047, 0.16]], 'square', 0.26);                  // ピンポン♪
+const sfxWrong = () => blip({ type: 'square', f0: 300, f1: 220, dur: 0.12, vol: 0.16 });    // 控えめ「ん?」
+const sfxSparkle = () => seq([[1047, 0.05], [1319, 0.05], [1568, 0.1]], 'triangle', 0.2);   // キラキラ
+const sfxHatch = () => seq([[523, 0.1], [659, 0.1], [784, 0.1], [1047, 0.22]], 'square', 0.26); // 孵化
+
+function toggleMute() { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.9; return muted; }
+function isMuted() { return muted; }
+function setSfxVolume(v) { sfxVolume = Math.max(0, Math.min(1, v)); if (sfxGain) sfxGain.gain.value = sfxVolume; }
+
+/* ===== core/speech.js ===== */
+// core/speech.js — Web Speech API (speechSynthesis) ラッパ。ja-JP・rate≈0.95。
+// voiceMode:"tts"|"file" の器を最初から用意（将来は録音音声へ差し替え・仕様§8.5）。
+// dash には無い mojisaurus 独自モジュール。音声アンロックは title のタップで primeSpeech()。
+
+const speech = { mode: 'tts', rate: VOICE_RATE, ready: false, voice: null, enabled: true };
+
+function synth() { return (typeof window !== 'undefined' && window.speechSynthesis) || null; }
+
+function pickVoice() {
+  const s = synth(); if (!s) return null;
+  const vs = s.getVoices() || [];
+  // ja-JP を優先、無ければ ja を含むもの
+  speech.voice = vs.find(v => v.lang === 'ja-JP') || vs.find(v => (v.lang || '').toLowerCase().startsWith('ja')) || null;
+  return speech.voice;
+}
+
+// 初回ユーザー操作で呼ぶ：空発話でエンジンを起こし、ボイス一覧を取得。
+function primeSpeech() {
+  const s = synth(); if (!s) return;
+  try {
+    if (s.onvoiceschanged === null) s.onvoiceschanged = pickVoice;
+    pickVoice();
+    const u = new SpeechSynthesisUtterance(' ');
+    u.volume = 0; u.lang = 'ja-JP';
+    s.speak(u);
+    speech.ready = true;
+  } catch (_) {}
+}
+
+// text を読み上げ。将来 file モードでは録音音声を鳴らす分岐に差し替える。
+function speak(text, o = {}) {
+  if (!speech.enabled || !text) return;
+  if (speech.mode === 'file') { /* TODO(Batch将来): assets/audio/voice/ を再生 */ return; }
+  const s = synth(); if (!s) return;
+  try {
+    if (o.interrupt !== false) s.cancel();
+    const u = new SpeechSynthesisUtterance(String(text));
+    u.lang = 'ja-JP';
+    u.rate = o.rate || speech.rate;
+    u.pitch = o.pitch || 1.05;
+    if (!speech.voice) pickVoice();
+    if (speech.voice) u.voice = speech.voice;
+    s.speak(u);
+  } catch (_) {}
+}
+
+function setVoiceMode(mode) { speech.mode = (mode === 'file') ? 'file' : 'tts'; }
+function setSpeechEnabled(on) { speech.enabled = !!on; if (!on) { const s = synth(); if (s) s.cancel(); } }
+
+/* ===== core/storage.js ===== */
+// core/storage.js — localStorage への JSON 保存/読込。version つき・破損時は初期化（仕様§8.6）。
+
+function makeDefault() {
+  return {
+    version: SAVE_VERSION,
+    stars: 0,
+    eggProgress: 0,
+    collection: { dino: [], insect: [], ghost: [] },
+    mastery: {},
+    settings: { bgmOn: true, sfxVolume: 0.8, voiceMode: 'tts', sessionLength: 4, kanaNameDisplay: 'katakana' },
+    lastPlayed: null,
+  };
+}
+
+function ls() { try { return (typeof window !== 'undefined' && window.localStorage) || null; } catch (_) { return null; } }
+
+function loadSave() {
+  const store = ls(); if (!store) return makeDefault();
+  let raw = null; try { raw = store.getItem(SAVE_KEY); } catch (_) { return makeDefault(); }
+  if (!raw) return makeDefault();
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || data.version !== SAVE_VERSION) return makeDefault();
+    // 既定値に浅くマージ（キー欠落に強く）
+    const def = makeDefault();
+    return { ...def, ...data, settings: { ...def.settings, ...(data.settings || {}) }, collection: { ...def.collection, ...(data.collection || {}) } };
+  } catch (_) { return makeDefault(); }
+}
+
+function writeSave(obj) {
+  const store = ls(); if (!store) return false;
+  try { obj.lastPlayed = new Date().toISOString(); store.setItem(SAVE_KEY, JSON.stringify(obj)); return true; } catch (_) { return false; }
+}
+
+function updateSave(patch) { const s = loadSave(); const next = { ...s, ...patch }; writeSave(next); return next; }
+
+function resetSave() { const store = ls(); try { if (store) store.removeItem(SAVE_KEY); } catch (_) {} return makeDefault(); }
+
+/* ===== core/assets.js ===== */
+// core/assets.js — アセット登録/読込の器（Batch1は最小）。画像未用意時は絵文字で代替（仕様§6.5注記）。
+// 差し替え可能なよう ID 参照。本読込は将来バッチで拡張。
+
+const EMOJI = {
+  egg: '🥚', dino: '🦖', insect: '🐛', ghost: '👻',
+  ari: '🐜', ringo: '🍎', densha: '🚃', star: '⭐',
+};
+
+const assets = { images: {}, ready: false };
+
+// 将来：画像/音声のプリロード。今は即 resolve。
+function loadAssets() { assets.ready = true; return Promise.resolve(assets); }
+function getEmoji(id) { return EMOJI[id] || '❓'; }
+
+/* ===== data/sample-strokes.js ===== */
+// data/sample-strokes.js — W1の仕組み検証用に4文字ぶんだけ収録した筆順データ。
+// 【本データ】KanjiVG (https://kanjivg.tagaini.net/) から実際の学参フォント準拠の筆順パスを抽出。
+// © Ulrich Apel / KanjiVG project — CC BY-SA 3.0（帰属は CREDITS.md に明記）。
+// バッチ3で ひらがな・カタカナ全92字ぶんに拡張予定（同じ抽出手順・同じスキーマで差し替え/追記するだけでよい設計）。
+const SAMPLE_STROKES = {
+  viewBox: '0 0 109 109',
+  order: ['し', 'く', 'こ', 'い'],   // レッスンで出す順（仮）
+  characters: {
+    'し': { strokeCount: 1, strokes: [
+      'M39.12,17.5c1.25,3.12,0.93,6.74,0.38,10.25c-2.12,13.5-3,26.5-3,39.12c0,27.38,19.88,30.12,45.5,17.25',
+    ] },
+    'く': { strokeCount: 1, strokes: [
+      'M60.66,15c0.5,1.62,0.35,5.44-1,7.38c-6.75,9.62-14.3,19.08-18.62,24.5c-4,5-3.79,7.03-0.88,11c5.5,7.5,12.75,18.75,17.62,27.25c1.48,2.59,2.75,4.75,4.5,8.62',
+    ] },
+    'こ': { strokeCount: 2, strokes: [
+      'M34.75,26.75c1.12,0.88,2.91,2.01,6,1.5c7.62-1.25,14.11-2.56,22.38-2.62c15.5-0.12,5.88,5-5.75,9',
+      'M30,68.12c2.25,14.5,15.26,17.96,31,16.75c6.5-0.5,11.88-1.25,17.62-2.88',
+    ] },
+    'い': { strokeCount: 2, strokes: [
+      'M21.5,29.66c2.01,2.17,2.61,4.68,2.17,7.43c-3.09,19.16-1.03,32.01,7.93,41.45c6.12,6.45,6.26,3.14,7.04-5.21',
+      'M72.96,36.51c9.44,8.05,17.79,18.82,18.41,33.83',
+    ] },
+  },
+};
+
+/* ===== data/sample-creatures.js ===== */
+// data/sample-creatures.js — 【仮データ・プレースホルダ】ずかん動作確認用の仲間リスト（各系統3体）。
+// バッチ3で data/creatures.json（本データ・画像）に差し替え予定。絵文字はcore/assets.jsのEMOJIで代替。
+const SAMPLE_CREATURES = {
+  dino: [
+    { id: 'dino_01', name: 'ガオン', kana: 'がおん' },
+    { id: 'dino_02', name: 'ステゴン', kana: 'すてごん' },
+    { id: 'dino_03', name: 'プテラン', kana: 'ぷてらん' },
+  ],
+  insect: [
+    { id: 'ins_01', name: 'クワガー', kana: 'くわがー' },
+    { id: 'ins_02', name: 'テントン', kana: 'てんとん' },
+    { id: 'ins_03', name: 'アリンコ', kana: 'ありんこ' },
+  ],
+  ghost: [
+    { id: 'gho_01', name: 'ボヤン', kana: 'ぼやん' },
+    { id: 'gho_02', name: 'ヒュード', kana: 'ひゅーど' },
+    { id: 'gho_03', name: 'ポワワ', kana: 'ぽわわ' },
+  ],
+};
+const CATEGORY_ORDER = ['dino', 'insect', 'ghost'];
+const CATEGORY_LABEL = { dino: 'きょうりゅう', insect: 'むし', ghost: 'おばけ' };
+
+/* ===== ui/button.js ===== */
+// ui/button.js — 再利用可能な角丸ボタン。矩形＋ラベル＋押下演出＋ヒットテストを1つにまとめる。
+// 描画は core/canvas.js の pill() に委譲（見た目の一貫性を1箇所に集約）。
+
+class Button {
+  constructor(o = {}) {
+    this.x = o.x || 0; this.y = o.y || 0; this.w = o.w || 200; this.h = o.h || 72;
+    this.label = o.label || ''; this.fill = o.fill || '#57c06a'; this.top = o.top || '#8fe19a';
+    this.labelColor = o.labelColor || '#ffffff'; this.labelSize = o.labelSize || 30;
+    this.radius = o.radius; this.disabled = !!o.disabled; this.onTap = o.onTap || null;
+    this._pressed = false;
+  }
+  setRect(x, y, w, h) { this.x = x; this.y = y; if (w != null) this.w = w; if (h != null) this.h = h; return this; }
+  hitTest(x, y) { return !this.disabled && pointInRect(x, y, this); }
+  press() { if (!this.disabled) this._pressed = true; }
+  release() { this._pressed = false; }
+  // ヒット→押下演出→(遅延後)コールバック、を一括で行うヘルパ。各シーンの定型処理を削減。
+  tap(delayMs = 120) {
+    this.press();
+    const cb = this.onTap;
+    setTimeout(() => { this.release(); if (cb) cb(); }, delayMs);
+  }
+  render() {
+    pill(this, { fill: this.fill, top: this.top, label: this.label, labelSize: this.labelSize, labelColor: this.labelColor, pressed: this._pressed, radius: this.radius });
+  }
+}
+
+/* ===== ui/gao.js ===== */
+// ui/gao.js — ナビキャラ「ガオ」の再利用ウィジェット。待機ボブ＋ムード切替（一定時間で normal に自動復帰）。
+
+class Gao {
+  constructor(o = {}) {
+    this.x = o.x || 0; this.y = o.y || 0; this.size = o.size || 60;
+    this.mood = o.mood || 'normal'; this.t = 0;
+    this.bobSpeed = o.bobSpeed ?? 2.4; this.bobAmp = o.bobAmp ?? 6;
+    this._moodUntil = 0;
+  }
+  setMood(mood, holdSeconds) { this.mood = mood; this._moodUntil = holdSeconds ? this.t + holdSeconds : 0; }
+  update(dt) { this.t += dt; if (this._moodUntil && this.t > this._moodUntil) { this.mood = 'normal'; this._moodUntil = 0; } }
+  render() { const bob = Math.sin(this.t * this.bobSpeed) * this.bobAmp; drawGao(this.x, this.y + bob, this.size, this.mood); }
+}
+
+/* ===== ui/star-fx.js ===== */
+// ui/star-fx.js — 正解演出「星が飛ぶ」。spawn位置→着地位置へ弧を描いて飛び、
+// 到達ごとに onArrive を呼ぶ（星カウント/たまごゲージへの加算は呼び出し側＝シーンが行う）。
+
+class StarField {
+  constructor() { this.stars = []; }
+  get isEmpty() { return this.stars.length === 0; }
+  spawn(fromX, fromY, toX, toY, o = {}) {
+    const count = o.count || 1;
+    for (let i = 0; i < count; i++) {
+      const delay = (o.stagger ?? 0.08) * i;
+      this.stars.push({
+        fromX, fromY, toX, toY, t: -delay, dur: o.duration || 0.65,
+        arc: o.arc ?? (40 + Math.random() * 30),
+        rot: Math.random() * Math.PI * 2, rotSpeed: (Math.random() > 0.5 ? 1 : -1) * (3 + Math.random() * 2),
+        size: o.size || 20, onArrive: o.onArrive || null, done: false,
+      });
+    }
+  }
+  update(dt) {
+    for (const s of this.stars) {
+      if (s.done) continue;
+      s.t += dt;
+      if (s.t >= s.dur && !s._fired) { s._fired = true; if (s.onArrive) s.onArrive(); }
+      if (s.t >= s.dur + 0.05) s.done = true;
+    }
+    if (this.stars.some(s => s.done)) this.stars = this.stars.filter(s => !s.done);
+  }
+  render() {
+    for (const s of this.stars) {
+      if (s.t < 0) continue;
+      const p = Math.max(0, Math.min(1, s.t / s.dur));
+      const ease = 1 - Math.pow(1 - p, 3);
+      const x = s.fromX + (s.toX - s.fromX) * ease;
+      const y = s.fromY + (s.toY - s.fromY) * ease - Math.sin(p * Math.PI) * s.arc;
+      const scale = 1 - 0.35 * ease;
+      ctx.save(); ctx.translate(x, y); ctx.rotate(s.rot + s.rotSpeed * s.t); ctx.scale(scale, scale);
+      drawStar(0, 0, s.size);
+      ctx.restore();
+    }
+  }
+}
+
+function drawStar(cx, cy, r) {
+  ctx.save();
+  ctx.fillStyle = '#ffc53a'; ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = Math.max(1, r * 0.08);
+  ctx.beginPath();
+  for (let i = 0; i < 5; i++) {
+    const a1 = (Math.PI * 2 * i) / 5 - Math.PI / 2, a2 = a1 + Math.PI / 5;
+    const x1 = cx + Math.cos(a1) * r, y1 = cy + Math.sin(a1) * r;
+    const x2 = cx + Math.cos(a2) * r * 0.42, y2 = cy + Math.sin(a2) * r * 0.42;
+    if (i === 0) ctx.moveTo(x1, y1); else ctx.lineTo(x1, y1);
+    ctx.lineTo(x2, y2);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+/* ===== ui/egg-gauge.js ===== */
+// ui/egg-gauge.js — たまごゲージ（0..max）。値はイージングで滑らかに追従、満タン到達で onHatch を一度だけ発火。
+
+class EggGauge {
+  constructor(o = {}) {
+    this.max = o.max || 22; this.value = o.value || 0; this.display = this.value;
+    this.onHatch = o.onHatch || null; this._hatchFiredAt = -1;
+  }
+  setValue(v) { this.value = Math.max(0, v); }
+  add(n) { this.setValue(this.value + n); }
+  update(dt) {
+    this.display += (this.value - this.display) * Math.min(1, dt * 6);
+    if (Math.abs(this.value - this.display) < 0.02) this.display = this.value;
+    if (this.value >= this.max && this.display >= this.max - 0.05 && this._hatchFiredAt !== this.value) {
+      this._hatchFiredAt = this.value; if (this.onHatch) this.onHatch();
+    }
+  }
+  render(x, y, w, h) {
+    const p = Math.max(0, Math.min(1, this.display / this.max));
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; rrPath(x, y, w, h, h / 2); ctx.fill();
+    ctx.fillStyle = COLORS.accent; rrPath(x + 3, y + 3, Math.max(0, (w - 6) * p), h - 6, (h - 6) / 2); ctx.fill();
+    label('🥚', x + w + 22, y + h / 2, { size: h * 1.3 });
+  }
+}
+
+/* ===== games/game-base.js ===== */
+// games/game-base.js — 全ミニゲーム共通インターフェース（仕様§8.3）。
+// 注：仕様書は `export default class` だが、本プロジェクトのビルド規約（末尾の単一行 export { ... }）
+// に合わせ、named export に変換して定義する（連結ビルドの都合。公開contractの中身は仕様どおり）。
+class GameBase {
+  init(ctx, services, params, question) {}  // services:{audio,speech,input,storage}
+  update(dt) {}
+  render(ctx) {}
+  onPointerDown(x, y) {}
+  onPointerMove(x, y) {}
+  onPointerUp(x, y) {}
+  isComplete() { return false; }
+  getResult() { return { correctCount: 0, mistakes: 0, itemsPracticed: [] }; }
+  dispose() {}
+}
+
+/* ===== games/w1-nazori-hira.js ===== */
+// games/w1-nazori-hira.js — 【W1】なぞりがき・ひらがな（仕様§4 Pillar A、判定は§7）。
+// GameBase契約を実装。手書き文字認識はしない＝「順番通りになぞれたか」だけを見る（§7-7）。
+
+const COUNT_WORDS = ['いち', 'に', 'さん', 'よん', 'ご', 'ろく'];
+const SCREEN_SPACING = 9;      // なぞり判定点の画面上の間隔(px)
+const DEMO_PX_PER_SEC = 170;   // 手本アニメの描画速度の目安
+
+// path-space の d文字列 → 画面座標のポリライン（累積距離つき）に変換。
+function buildScreenPoly(d, scale, offsetX, offsetY) {
+  const flat = flattenCommands(parsePathD(d), 26).map(p => ({ x: offsetX + p.x * scale, y: offsetY + p.y * scale }));
+  return withLengths(flat);
+}
+function evenPoints(poly, spacing) {
+  const n = Math.max(2, Math.round(poly.total / spacing));
+  const pts = []; for (let i = 0; i <= n; i++) pts.push(pointAtLength(poly, (i / n) * poly.total));
+  return pts;
+}
+// 累積距離 upToLen までの部分ポリライン（手本アニメの「描かれている途中」表現用）。
+function partialPoints(poly, upToLen) {
+  const out = [];
+  for (let i = 0; i < poly.pts.length; i++) { if (poly.acc[i] <= upToLen) out.push(poly.pts[i]); else break; }
+  out.push(pointAtLength(poly, upToLen));
+  return out;
+}
+
+class W1NazoriHira extends GameBase {
+  init(ctx, services, params, question) {
+    this.services = services || {};
+    this.kana = question.kana;
+    const { w, h } = parseViewBox(question.viewBox, 100);
+    const boxSize = params.boxSize || 220;
+    const scale = boxSize / Math.max(w, h);
+    const offsetX = (params.centerX || 0) - (w * scale) / 2;
+    const offsetY = (params.centerY || 0) - (h * scale) / 2;
+
+    this.strokes = (question.data.strokes || []).map((d) => {
+      const poly = buildScreenPoly(d, scale, offsetX, offsetY);
+      return { poly, points: evenPoints(poly, SCREEN_SPACING), duration: Math.max(0.5, Math.min(1.3, poly.total / DEMO_PX_PER_SEC)) };
+    });
+
+    this.R = params.toleranceR || 26;
+    this.strokeIndex = 0; this.cursor = 0; this.trail = [];
+    this.mistakes = 0; this._strayCount = 0; this.tracing = false;
+    this.state = 'demo'; this.demoT = 0;
+    this._speak(this.kana);
+    this._speakStrokeStart();
+  }
+
+  _speak(text) { if (this.services.speech && this.services.speech.speak) this.services.speech.speak(text); }
+  _sfx(name) { const a = this.services.audio; if (a && typeof a[name] === 'function') a[name](); }
+  _speakStrokeStart() { this._speak(COUNT_WORDS[this.strokeIndex] || 'つぎ'); }
+
+  update(dt) {
+    if (this.state !== 'demo') return;
+    const s = this.strokes[this.strokeIndex]; if (!s) return;
+    this.demoT += dt;
+    if (this.demoT >= s.duration) {
+      this.strokeIndex++;
+      if (this.strokeIndex >= this.strokes.length) {
+        this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = [];
+        this._speak('なぞってみよう');
+      } else { this.demoT = 0; this._speakStrokeStart(); }
+    }
+  }
+
+  render(ctx) {
+    // 全画のうすいガイド
+    ctx.save(); ctx.strokeStyle = 'rgba(43,58,103,0.18)'; ctx.lineWidth = 10; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (const s of this.strokes) this._strokePath(ctx, s.poly.pts);
+    ctx.restore();
+
+    if (this.state === 'demo') {
+      for (let i = 0; i < this.strokeIndex; i++) this._drawDone(ctx, this.strokes[i]);
+      const cur = this.strokes[this.strokeIndex];
+      if (cur) {
+        const upTo = (this.demoT / cur.duration) * cur.poly.total;
+        const pts = partialPoints(cur.poly, upTo);
+        ctx.save(); ctx.strokeStyle = '#ff8a5c'; ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        this._strokePath(ctx, pts); ctx.restore();
+        const tip = pts[pts.length - 1];
+        if (tip) this._drawFinger(ctx, tip.x, tip.y);
+      }
+    } else if (this.state === 'trace') {
+      for (let i = 0; i < this.strokeIndex; i++) this._drawDone(ctx, this.strokes[i]);
+      const cur = this.strokes[this.strokeIndex];
+      if (cur) {
+        ctx.save(); ctx.setLineDash([14, 10]); ctx.strokeStyle = 'rgba(87,192,106,0.9)'; ctx.lineWidth = 11; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        this._strokePath(ctx, cur.points); ctx.restore();
+        if (this.trail.length > 1) { ctx.save(); ctx.strokeStyle = '#2b8f43'; ctx.lineWidth = 10; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; this._strokePath(ctx, this.trail); ctx.restore(); }
+        const target = cur.points[Math.min(this.cursor, cur.points.length - 1)];
+        ctx.save(); ctx.fillStyle = 'rgba(255,197,58,0.9)'; ctx.beginPath(); ctx.arc(target.x, target.y, 12, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+      }
+    } else if (this.state === 'complete') {
+      for (const s of this.strokes) this._drawDone(ctx, s);
+    }
+  }
+
+  _strokePath(ctx, pts) { if (pts.length < 2) return; ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y); ctx.stroke(); }
+  _drawDone(ctx, s) { ctx.save(); ctx.strokeStyle = '#57c06a'; ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; this._strokePath(ctx, s.poly.pts); ctx.restore(); }
+  _drawFinger(ctx, x, y) { ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.strokeStyle = '#2b3a67'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore(); }
+
+  onPointerDown(x, y) {
+    if (this.state === 'demo') { this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = []; this._speak('なぞってみよう'); }
+    if (this.state !== 'trace') return;
+    this.tracing = true; this.trail = [{ x, y }];
+    this._advanceCursor(x, y);
+  }
+  onPointerMove(x, y) {
+    if (this.state !== 'trace' || !this.tracing) return;
+    this.trail.push({ x, y }); if (this.trail.length > 400) this.trail.shift();
+    this._advanceCursor(x, y);
+  }
+  onPointerUp() { this.tracing = false; }
+
+  _advanceCursor(x, y) {
+    const s = this.strokes[this.strokeIndex]; if (!s) return;
+    const pts = s.points;
+    const startR = this.R * 1.6, R = this.R, bigMissR = this.R * 3.5;
+    while (this.cursor < pts.length - 1) {
+      const targetR = this.cursor === 0 ? startR : R;
+      if (Math.hypot(x - pts[this.cursor].x, y - pts[this.cursor].y) <= targetR) this.cursor++; else break;
+    }
+    const cIdx = Math.min(this.cursor, pts.length - 1);
+    const dCur = Math.hypot(x - pts[cIdx].x, y - pts[cIdx].y);
+    this._strayCount = (dCur > bigMissR) ? (this._strayCount + 1) : 0;
+    if (this._strayCount > 18) {
+      this._strayCount = 0; this.cursor = 0; this.trail = []; this.mistakes++;
+      this._speak('もういちど、じゅんばんに なぞってね');
+      return;
+    }
+    if (this.cursor >= pts.length - 1) {
+      this.strokeIndex++; this.cursor = 0; this.trail = [];
+      if (this.strokeIndex >= this.strokes.length) { this.state = 'complete'; this._sfx('sfxSparkle'); }
+      else this._sfx('sfxTap');
+    }
+  }
+
+  isComplete() { return this.state === 'complete'; }
+  getResult() { return { correctCount: 1, mistakes: this.mistakes, itemsPracticed: [this.kana] }; }
+  dispose() {}
+}
+
+/* ===== core/scene-manager.js ===== */
+// core/scene-manager.js — シーンの登録/切替と、update/render/ポインタの現在シーンへの委譲。
+// シーン契約：任意で enter()/update(dt)/render()/onPointerDown(x,y)/onPointerMove(x,y)/onPointerUp(x,y)/dispose()。
+// scene クラスの import はしない（登録は main.js。連結順の依存を避けるため）。
+
+class SceneManager {
+  constructor() { this.scenes = {}; this.current = null; this.currentName = null; }
+  register(name, scene) { this.scenes[name] = scene; scene.manager = this; return this; }
+  set(name, params) {
+    const s = this.scenes[name]; if (!s) { console.warn('[scene] unknown:', name); return; }
+    if (this.current && this.current.dispose) { try { this.current.dispose(); } catch (_) {} }
+    this.currentName = name; this.current = s;
+    if (s.enter) { try { s.enter(params); } catch (e) { console.error('[scene enter]', name, e); } }
+  }
+  update(dt) { const c = this.current; if (c && c.update) c.update(dt); }
+  render() { const c = this.current; if (c && c.render) c.render(); }
+  onPointerDown(x, y) { const c = this.current; if (c && c.onPointerDown) c.onPointerDown(x, y); }
+  onPointerMove(x, y) { const c = this.current; if (c && c.onPointerMove) c.onPointerMove(x, y); }
+  onPointerUp(x, y) { const c = this.current; if (c && c.onPointerUp) c.onPointerUp(x, y); }
+}
+
+const scenes = new SceneManager();
+
+/* ===== core/game-loop.js ===== */
+// core/game-loop.js — 固定タイムステップのメインループ（dash 同型）。scenes に委譲。
+
+const clock = { t: 0 };          // 経過秒（演出の時間基準・シーンから参照可）
+let _last = 0, _acc = 0, _running = false;
+
+function frame(t) {
+  if (!_running) return;
+  if (!_last) _last = t;
+  let dt = (t - _last) / 1000; _last = t;
+  if (dt > 0.1) dt = 0.1;        // タブ復帰などの巨大 dt を抑制
+  clock.t += dt; _acc += dt;
+  let steps = 0;
+  while (_acc >= STEP && steps < 5) { scenes.update(STEP); _acc -= STEP; steps++; }
+  if (_acc > STEP) _acc = 0;
+  scenes.render();
+  requestAnimationFrame(frame);
+}
+function startLoop() { if (_running) return; _running = true; _last = 0; _acc = 0; requestAnimationFrame(frame); }
+function stopLoop() { _running = false; }
+
+/* ===== scenes/title.js ===== */
+// scenes/title.js — 起動画面。「タップしてスタート」。ここで音声アンロック（input.js が実行）→ home へ。
+
+class TitleScene {
+  enter() { this.t = 0; this.started = false; }
+  update(dt) { this.t += dt; }
+  render() {
+    fillBg();
+    const cx = view.w / 2;
+    // タイトル
+    label('もじ', cx - 92, view.h * 0.28, { size: Math.min(view.w * 0.16, 120), color: COLORS.accent, weight: 800, shadow: 3 });
+    label('ざうるす', cx + 74, view.h * 0.28, { size: Math.min(view.w * 0.16, 120), color: '#ff8a5c', weight: 800, shadow: 3 });
+    // ガオ（ぴょこぴょこ）
+    const bob = Math.sin(this.t * 3) * 8;
+    drawGao(cx, view.h * 0.55 + bob, Math.min(view.w * 0.12, 78), 'happy');
+    // 「タップしてスタート」点滅
+    const a = 0.55 + 0.45 * Math.sin(this.t * 4);
+    ctx.save(); ctx.globalAlpha = a;
+    label('タップして スタート', cx, view.h * 0.82, { size: Math.min(view.w * 0.055, 40), color: COLORS.ink, weight: 800, shadow: 1.5 });
+    ctx.restore();
+  }
+  onPointerDown() {
+    if (this.started) return; this.started = true;   // 二度押し防止
+    sfxTap();
+    speak('もじざうるすへ ようこそ！');
+    scenes.set(SCENE.HOME);
+  }
+}
+
+/* ===== scenes/home.js ===== */
+// scenes/home.js — ホーム。大ボタン＋たまごゲージ＋ガオ。ui/ の再利用ウィジェットを使用。
+// 学習ボタンは target(遷移先)に加え mode を持たせ、lesson側で出題モードを判別する。
+
+class HomeScene {
+  enter() {
+    this.t = 0;
+    this.save = loadSave();
+    this.gao = new Gao({ mood: 'normal' });
+    this.egg = new EggGauge({ max: STARS_PER_EGG, value: this.save.eggProgress || 0 });
+    const specs = [
+      { label: 'かく', target: SCENE.LESSON, mode: 'write', fill: COLORS.btnKaku, top: '#ffb190' },
+      { label: 'ことばあそび', target: SCENE.LESSON, mode: 'vocab', fill: COLORS.btnKotoba, top: '#8fe19a' },
+      { label: 'カタカナ・とくべつ', target: SCENE.LESSON, mode: 'katakana', fill: COLORS.btnKatakana, top: '#d3b8ff' },
+      { label: 'ずかん', target: SCENE.ZUKAN, fill: COLORS.btnZukan, top: '#a6e2ff', small: true },
+      { label: 'おうちのかた', target: SCENE.PARENT, fill: COLORS.btnParent, top: '#e3d3b6', labelColor: COLORS.ink, small: true },
+    ];
+    this.buttons = specs.map(s => new Button({ label: s.label, fill: s.fill, top: s.top, labelColor: s.labelColor, onTap: () => scenes.set(s.target, { mode: s.mode }) }));
+    this._meta = specs;
+    this._layout();
+  }
+
+  _layout() {
+    const W = view.w, H = view.h;
+    this.gao.x = W * 0.12; this.gao.y = H * 0.6; this.gao.size = Math.min(W * 0.075, 56);
+    const topPad = H * 0.20;
+    const cols = W >= 720 ? 3 : 1;
+    const bw = cols === 3 ? Math.min(W * 0.27, 300) : Math.min(W * 0.8, 460);
+    const bh = cols === 3 ? Math.min(H * 0.28, 150) : Math.min(H * 0.13, 84);
+    const gapX = cols === 3 ? (W - bw * 3) / 4 : 0;
+    const gapY = bh * 0.28;
+    for (let i = 0; i < 3; i++) {
+      let x, y;
+      if (cols === 3) { x = gapX + i * (bw + gapX); y = topPad + (H - topPad) * 0.12; }
+      else { x = (W - bw) / 2; y = topPad + i * (bh + gapY); }
+      this.buttons[i].setRect(x, y, bw, bh); this.buttons[i].labelSize = cols === 3 ? 34 : 30;
+    }
+    const sw = Math.min(W * 0.32, 240), sh = Math.min(H * 0.12, 72);
+    const sy = H - sh - H * 0.05, sgap = Math.min(W * 0.06, 40);
+    const totalW = sw * 2 + sgap, sx0 = (W - totalW) / 2;
+    this.buttons[3].setRect(sx0, sy, sw, sh); this.buttons[3].labelSize = 28;
+    this.buttons[4].setRect(sx0 + sw + sgap, sy, sw, sh); this.buttons[4].labelSize = 22;
+  }
+
+  drawEggGauge() {
+    const W = view.w, H = view.h, bw = Math.min(W * 0.6, 460), bh = 26, x = (W - bw) / 2, y = H * 0.09;
+    label('たまごまで', x - 8, y + bh / 2, { size: 22, align: 'right', color: COLORS.ink, weight: 800 });
+    this.egg.render(x, y, bw, bh);
+    label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + bh + 22, { size: 18, color: COLORS.ink, weight: 700 });
+  }
+
+  update(dt) { this.t += dt; this.gao.update(dt); this.egg.update(dt); }
+  render() {
+    fillBg(); this._layout(); this.drawEggGauge();
+    this.gao.render();
+    for (const b of this.buttons) b.render();
+  }
+  onPointerDown(x, y) {
+    for (let i = 0; i < this.buttons.length; i++) {
+      const b = this.buttons[i];
+      if (b.hitTest(x, y)) { sfxTap(); speak(this._meta[i].label.replace('・', ' ')); b.tap(); return; }
+    }
+  }
+}
+
+/* ===== scenes/lesson.js ===== */
+// scenes/lesson.js — レッスン司会（P1: 「かく」=W1のみ実装。ことばあそび/カタカナ・とくべつは次バッチ）。
+// 出題キュー(仮データ)を順に回し、正解ごとに星を集計 → セッション終了時にまとめてstorageへ確定。
+// reward.js（本格な孵化演出シーン）は次バッチで切り出す想定。今回は孵化処理をここに簡易実装する。
+
+const STAR_PER_CORRECT = 1;
+
+function pickUnclaimed(collection) {
+  for (const cat of CATEGORY_ORDER) {
+    const have = collection[cat] || [];
+    const found = SAMPLE_CREATURES[cat].find(c => !have.includes(c.id));
+    if (found) return { cat, creature: found };
+  }
+  return null;
+}
+
+class LessonScene {
+  enter(params) {
+    this.mode = (params && params.mode) || 'write';
+    this.save = loadSave();
+    this.gao = new Gao({ x: view.w * 0.09, y: view.h * 0.16, size: Math.min(view.w * 0.05, 40) });
+    this.backBtn = new Button({ label: 'もどる', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.HOME) });
+    this.stars = new StarField();
+    this.homeBtn = new Button({ label: 'ホームへ', fill: COLORS.btnKaku, top: '#ffb190', labelSize: 26, onTap: () => scenes.set(SCENE.HOME) });
+    this.zukanBtn = new Button({ label: 'ずかんへ', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.ZUKAN) });
+
+    if (this.mode !== 'write') { this.state = 'unsupported'; return; }
+
+    const n = Math.max(1, Math.min(this.save.settings.sessionLength || 4, SAMPLE_STROKES.order.length));
+    this.queue = SAMPLE_STROKES.order.slice(0, n);
+    this.qIndex = 0; this.sessionStars = 0; this._wasComplete = false;
+    this.state = 'playing';
+    this._startQuestion();
+  }
+
+  _startQuestion() {
+    const kana = this.queue[this.qIndex];
+    this.charCenter = { x: view.w / 2, y: view.h * 0.56 };
+    const boxSize = Math.min(view.w, view.h) * 0.5;
+    this.game = new W1NazoriHira();
+    this.game.init(ctx, { audio: { sfxTap, sfxSparkle, sfxCorrect }, speech: { speak } },
+      { centerX: this.charCenter.x, centerY: this.charCenter.y, boxSize, toleranceR: 26 },
+      { kana, data: SAMPLE_STROKES.characters[kana], viewBox: SAMPLE_STROKES.viewBox });
+    this._wasComplete = false;
+  }
+
+  _onQuestionComplete() {
+    const res = this.game.getResult();
+    this.sessionStars += (res.correctCount || 0) * STAR_PER_CORRECT;
+    this.gao.setMood('cheer', 1.1);
+    this.stars.spawn(this.charCenter.x, this.charCenter.y, view.w - 60, 46, { count: 1, onArrive: () => {} });
+    setTimeout(() => { this.qIndex++; if (this.qIndex >= this.queue.length) this._finishSession(); else this._startQuestion(); }, 900);
+  }
+
+  _finishSession() {
+    const oldEgg = this.save.eggProgress || 0, oldStars = this.save.stars || 0;
+    const totalEgg = oldEgg + this.sessionStars;
+    const hatchCount = Math.floor(totalEgg / STARS_PER_EGG);
+    const newEggProgress = totalEgg % STARS_PER_EGG;
+    let collection = { ...this.save.collection };
+    const hatchedList = [];
+    for (let i = 0; i < hatchCount; i++) {
+      const picked = pickUnclaimed(collection);
+      if (!picked) break;
+      collection = { ...collection, [picked.cat]: [...(collection[picked.cat] || []), picked.creature.id] };
+      hatchedList.push(picked);
+    }
+    updateSave({ stars: oldStars + this.sessionStars, eggProgress: newEggProgress, collection });
+    this.save = loadSave();
+    this.hatchedList = hatchedList; this._finalEggProgress = newEggProgress;
+    this.egg = new EggGauge({ max: STARS_PER_EGG, value: oldEgg, onHatch: () => this._revealHatch() });
+    this.egg.setValue(hatchedList.length ? STARS_PER_EGG : newEggProgress);
+    this._revealStage = null;
+    this.state = 'summary';
+  }
+
+  _revealHatch() {
+    this._revealStage = 'card'; this._revealCreature = this.hatchedList[0] || null;
+    this._extraCount = Math.max(0, this.hatchedList.length - 1);
+    sfxHatch();
+    if (this._revealCreature) speak(`たまごが われたよ！ ${this._revealCreature.creature.name} が なかまに なった！`);
+    else speak('たまごが われたよ！');
+    setTimeout(() => { if (this.egg) this.egg.setValue(this._finalEggProgress); }, 1300);
+  }
+
+  update(dt) {
+    this.gao.update(dt); this.stars.update(dt);
+    if (this.state === 'playing' && this.game) {
+      this.game.update(dt);
+      if (!this._wasComplete && this.game.isComplete()) { this._wasComplete = true; this._onQuestionComplete(); }
+    }
+    if (this.state === 'summary' && this.egg) this.egg.update(dt);
+  }
+
+  render() {
+    fillBg();
+    if (this.state === 'unsupported') { this._renderUnsupported(); return; }
+    if (this.state === 'playing') { this._renderPlaying(); return; }
+    if (this.state === 'summary') { this._renderSummary(); return; }
+  }
+
+  _renderUnsupported() {
+    label('このモードは', view.w / 2, view.h * 0.38, { size: Math.min(view.w * 0.06, 38), color: COLORS.ink, weight: 800 });
+    label('じゅんびちゅう だよ', view.w / 2, view.h * 0.46, { size: Math.min(view.w * 0.07, 44), color: COLORS.ink, weight: 800, shadow: 2 });
+    label('（つぎのアップデートで あそべるようになるよ）', view.w / 2, view.h * 0.55, { size: Math.min(view.w * 0.04, 22), color: COLORS.ink, weight: 600 });
+    this.backBtn.setRect(view.w * 0.04, view.h * 0.04, Math.min(view.w * 0.28, 190), Math.min(view.h * 0.11, 66));
+    this.backBtn.render();
+  }
+
+  _renderPlaying() {
+    this.gao.render();
+    label(`${this.qIndex + 1} / ${this.queue.length} もんめ`, view.w / 2, view.h * 0.08, { size: 22, color: COLORS.ink, weight: 700 });
+    // セッション中のほしバッジ（本ゲージへの反映はセッション終了時にまとめて）
+    label('⭐', view.w - 60, 46, { size: 30 });
+    label(String(this.sessionStars), view.w - 30, 50, { size: 24, color: COLORS.ink, weight: 800, align: 'left' });
+    if (this.game) this.game.render(ctx);
+    this.stars.render();
+  }
+
+  _renderSummary() {
+    label('よくできました！', view.w / 2, view.h * 0.16, { size: Math.min(view.w * 0.07, 44), color: COLORS.ink, weight: 800, shadow: 2 });
+    label(`⭐ ${this.sessionStars}こ ふえたよ`, view.w / 2, view.h * 0.25, { size: Math.min(view.w * 0.045, 26), color: COLORS.ink, weight: 700 });
+    const gw = Math.min(view.w * 0.55, 420), gh = 26, gx = (view.w - gw) / 2, gy = view.h * 0.34;
+    if (this.egg) this.egg.render(gx, gy, gw, gh);
+    this.gao.x = view.w * 0.5; this.gao.y = view.h * 0.56; this.gao.size = Math.min(view.w * 0.09, 66);
+    this.gao.render();
+
+    if (this._revealStage === 'card') {
+      const c = this._revealCreature;
+      const boxW = Math.min(view.w * 0.7, 460), boxH = view.h * 0.24, bx = (view.w - boxW) / 2, by = view.h * 0.68;
+      ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 4;
+      const r = 24; ctx.beginPath(); ctx.moveTo(bx + r, by); ctx.arcTo(bx + boxW, by, bx + boxW, by + boxH, r); ctx.arcTo(bx + boxW, by + boxH, bx, by + boxH, r); ctx.arcTo(bx, by + boxH, bx, by, r); ctx.arcTo(bx, by, bx + boxW, by, r); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+      if (c) {
+        label(getEmoji(c.cat), view.w / 2, by + boxH * 0.38, { size: 56 });
+        label(`${c.creature.name} が なかまに なった！`, view.w / 2, by + boxH * 0.78, { size: Math.min(view.w * 0.04, 22), color: COLORS.ink, weight: 700 });
+      } else {
+        label('たまごが われたよ！', view.w / 2, by + boxH * 0.5, { size: 24, color: COLORS.ink, weight: 700 });
+      }
+      if (this._extraCount > 0) label(`（ほかにも ${this._extraCount}ひき！）`, view.w / 2, by + boxH * 0.95, { size: 16, color: COLORS.ink, weight: 600 });
+    }
+
+    const bw = Math.min(view.w * 0.36, 220), bh = Math.min(view.h * 0.1, 64), by2 = view.h * 0.94 - bh, gap = 20;
+    const showZukan = this.hatchedList && this.hatchedList.length > 0;
+    if (showZukan) { this.zukanBtn.setRect(view.w / 2 - bw - gap / 2, by2, bw, bh); this.zukanBtn.render(); this.homeBtn.setRect(view.w / 2 + gap / 2, by2, bw, bh); this.homeBtn.render(); }
+    else { this.homeBtn.setRect((view.w - bw) / 2, by2, bw, bh); this.homeBtn.render(); }
+    this._btnRects = showZukan ? [this.zukanBtn, this.homeBtn] : [this.homeBtn];
+  }
+
+  onPointerDown(x, y) {
+    if (this.state === 'unsupported') { if (this.backBtn.hitTest(x, y)) { sfxTap(); this.backBtn.tap(); } return; }
+    if (this.state === 'playing') { if (this.game) this.game.onPointerDown(x, y); return; }
+    if (this.state === 'summary') { for (const b of (this._btnRects || [])) if (b.hitTest(x, y)) { sfxTap(); b.tap(); return; } }
+  }
+  onPointerMove(x, y) { if (this.state === 'playing' && this.game) this.game.onPointerMove(x, y); }
+  onPointerUp(x, y) { if (this.state === 'playing' && this.game) this.game.onPointerUp(x, y); }
+}
+
+/* ===== scenes/game-select.js ===== */
+// scenes/game-select.js — Batch1 は雛形（じゅんびちゅう）。もどる で home へ。実装は後続バッチ。
+
+class GameSelectScene {
+  enter() { this.t = 0; speak('じゅんびちゅう だよ'); }
+  update(dt) { this.t += dt; }
+  backRect() { const w = Math.min(view.w * 0.28, 190), h = Math.min(view.h * 0.11, 66); return { x: view.w * 0.04, y: view.h * 0.04, w, h }; }
+  render() {
+    fillBg();
+    label('ゲームせんたく', view.w / 2, view.h * 0.4, { size: Math.min(view.w * 0.08, 56), color: COLORS.ink, weight: 800, shadow: 2 });
+    label('じゅんびちゅう（Batch2いこう）', view.w / 2, view.h * 0.56, { size: Math.min(view.w * 0.048, 30), color: COLORS.ink, weight: 700 });
+    this._back = this.backRect();
+    pill(this._back, { fill: COLORS.btnZukan, top: '#a6e2ff', label: 'もどる', labelSize: 26 });
+  }
+  onPointerDown(x, y) { if (pointInRect(x, y, this._back || this.backRect())) { sfxTap(); scenes.set(SCENE.HOME); } }
+}
+
+/* ===== scenes/reward.js ===== */
+// scenes/reward.js — Batch1 は雛形（じゅんびちゅう）。もどる で home へ。実装は後続バッチ。
+
+class RewardScene {
+  enter() { this.t = 0; speak('じゅんびちゅう だよ'); }
+  update(dt) { this.t += dt; }
+  backRect() { const w = Math.min(view.w * 0.28, 190), h = Math.min(view.h * 0.11, 66); return { x: view.w * 0.04, y: view.h * 0.04, w, h }; }
+  render() {
+    fillBg();
+    label('ごほうび', view.w / 2, view.h * 0.4, { size: Math.min(view.w * 0.08, 56), color: COLORS.ink, weight: 800, shadow: 2 });
+    label('じゅんびちゅう（Batch2いこう）', view.w / 2, view.h * 0.56, { size: Math.min(view.w * 0.048, 30), color: COLORS.ink, weight: 700 });
+    this._back = this.backRect();
+    pill(this._back, { fill: COLORS.btnZukan, top: '#a6e2ff', label: 'もどる', labelSize: 26 });
+  }
+  onPointerDown(x, y) { if (pointInRect(x, y, this._back || this.backRect())) { sfxTap(); scenes.set(SCENE.HOME); } }
+}
+
+/* ===== scenes/zukan.js ===== */
+// scenes/zukan.js — ずかん（仕様§5.3）。3系統タブ、取得済み=絵入り／未取得=シルエット＋「？」。
+// タップで名前を音声再生。名前表記は settings.kanaNameDisplay（ひらがな/カタカナ）で切替。
+
+const TAB_FILL = { dino: COLORS.btnKaku, insect: COLORS.btnKotoba, ghost: COLORS.btnKatakana };
+
+class ZukanScene {
+  enter() {
+    this.save = loadSave(); this.tab = 'dino';
+    this.tabButtons = CATEGORY_ORDER.map(cat => new Button({ label: CATEGORY_LABEL[cat], fill: TAB_FILL[cat], labelSize: 22, onTap: () => { this.tab = cat; } }));
+    this.backBtn = new Button({ label: 'もどる', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.HOME) });
+  }
+
+  _totalObtained() { return CATEGORY_ORDER.reduce((n, c) => n + ((this.save.collection[c] || []).length), 0); }
+  _totalAll() { return CATEGORY_ORDER.reduce((n, c) => n + SAMPLE_CREATURES[c].length, 0); }
+
+  _layout() {
+    const W = view.w, H = view.h;
+    const tw = Math.min(W * 0.26, 200), th = Math.min(H * 0.09, 56), tgap = 12;
+    const totalW = tw * 3 + tgap * 2, tx0 = (W - totalW) / 2, ty = H * 0.1;
+    this.tabButtons.forEach((b, i) => b.setRect(tx0 + i * (tw + tgap), ty, tw, th));
+    this.backBtn.setRect(W * 0.04, H * 0.04, Math.min(W * 0.24, 150), Math.min(H * 0.09, 54));
+
+    const list = SAMPLE_CREATURES[this.tab];
+    const cols = 3, cellW = Math.min(W * 0.24, 190), cellH = cellW * 1.05;
+    const gapX = (W - cellW * cols) / (cols + 1);
+    const gridTop = ty + th + H * 0.05;
+    this.slots = list.map((creature, i) => {
+      const col = i % cols, row = Math.floor(i / cols);
+      const x = gapX + col * (cellW + gapX), y = gridTop + row * (cellH + H * 0.03);
+      return { creature, x, y, w: cellW, h: cellH };
+    });
+  }
+
+  update() {}
+  render() {
+    fillBg(); this._layout();
+    label('ずかん', view.w / 2, view.h * 0.045, { size: Math.min(view.w * 0.06, 36), color: COLORS.ink, weight: 800, shadow: 2 });
+    if (this._totalObtained() >= this._totalAll()) label('🎉 コンプリート！ 🎉', view.w / 2, view.h * 0.045 + 34, { size: 18, color: '#c9820a', weight: 800 });
+    this.backBtn.render();
+    this.tabButtons.forEach((b, i) => { b.labelColor = this.tab === CATEGORY_ORDER[i] ? '#ffffff' : '#ffffff'; b.render(); if (this.tab === CATEGORY_ORDER[i]) { ctx.save(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; rrPath(b.x - 2, b.y - 2, b.w + 4, b.h + 4, Math.min(b.w, b.h) * 0.34); ctx.stroke(); ctx.restore(); } });
+
+    const have = this.save.collection[this.tab] || [];
+    for (const s of this.slots) {
+      const obtained = have.includes(s.creature.id);
+      ctx.save(); ctx.fillStyle = obtained ? 'rgba(255,255,255,0.9)' : 'rgba(120,130,150,0.25)'; rrPath(s.x, s.y, s.w, s.h, 20); ctx.fill();
+      ctx.strokeStyle = obtained ? COLORS.accent : 'rgba(120,130,150,0.4)'; ctx.lineWidth = 3; rrPath(s.x, s.y, s.w, s.h, 20); ctx.stroke(); ctx.restore();
+      if (obtained) {
+        label(getEmoji(this.tab), s.x + s.w / 2, s.y + s.h * 0.42, { size: s.w * 0.34 });
+        const name = this.save.settings.kanaNameDisplay === 'hiragana' ? s.creature.kana : s.creature.name;
+        label(name, s.x + s.w / 2, s.y + s.h * 0.8, { size: Math.min(s.w * 0.13, 20), color: COLORS.ink, weight: 700 });
+      } else {
+        label('？', s.x + s.w / 2, s.y + s.h * 0.42, { size: s.w * 0.3, color: 'rgba(80,90,110,0.6)' });
+        label('？？？', s.x + s.w / 2, s.y + s.h * 0.8, { size: Math.min(s.w * 0.12, 18), color: 'rgba(80,90,110,0.55)' });
+      }
+    }
+  }
+
+  onPointerDown(x, y) {
+    if (this.backBtn.hitTest(x, y)) { sfxTap(); this.backBtn.tap(); return; }
+    for (const b of this.tabButtons) if (b.hitTest(x, y)) { sfxTap(); b.tap(); return; }
+    const have = this.save.collection[this.tab] || [];
+    for (const s of (this.slots || [])) {
+      if (pointInRect(x, y, s)) {
+        if (have.includes(s.creature.id)) { sfxTap(); const name = this.save.settings.kanaNameDisplay === 'hiragana' ? s.creature.kana : s.creature.name; speak(name); }
+        return;
+      }
+    }
+  }
+}
+
+/* ===== scenes/parent.js ===== */
+// scenes/parent.js — おうちのかたへ（仕様§8.7）。誤操作防止ゲート（3→1→5タップ）→進捗＋設定パネル。
+// 落ち着いた配色にして「おとなの場所」であることを視覚的にも示す（子ども向け画面と差をつける）。
+
+const GATE_SEQ = [3, 1, 5];
+
+class ParentScene {
+  enter() {
+    this.state = 'gate'; this.gateProgress = [];
+    this.save = loadSave(); this._confirming = false;
+    this.numButtons = [];
+    for (let d = 1; d <= 9; d++) this.numButtons.push(new Button({ label: String(d), fill: '#5c6b85', top: '#8492ab', labelSize: 28, onTap: () => this._tapDigit(d) }));
+    this.backGate = new Button({ label: 'もどる', fill: '#8a93a6', top: '#b7bfce', labelSize: 22, onTap: () => scenes.set(SCENE.HOME) });
+    this.backPanel = new Button({ label: 'もどる', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.HOME) });
+    this.sfxMinus = new Button({ label: '－', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustSfx(-0.1) });
+    this.sfxPlus = new Button({ label: '＋', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustSfx(0.1) });
+    this.voiceToggle = new Button({ label: '', fill: '#94a3c4', labelSize: 18, onTap: () => this._toggleVoiceMode() });
+    this.nameToggle = new Button({ label: '', fill: '#94a3c4', labelSize: 18, onTap: () => this._toggleNameDisplay() });
+    this.lenMinus = new Button({ label: '－', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustLen(-1) });
+    this.lenPlus = new Button({ label: '＋', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustLen(1) });
+    this.resetBtn = new Button({ label: 'データを リセット', fill: '#d9614f', top: '#ea8a7a', labelSize: 20, onTap: () => { this._confirming = true; } });
+    this.resetYes = new Button({ label: 'はい、リセットする', fill: '#d9614f', top: '#ea8a7a', labelSize: 18, onTap: () => this._doReset() });
+    this.resetNo = new Button({ label: 'キャンセル', fill: '#8a93a6', top: '#b7bfce', labelSize: 18, onTap: () => { this._confirming = false; } });
+  }
+
+  _tapDigit(d) {
+    sfxTap();
+    const i = this.gateProgress.length;
+    if (d === GATE_SEQ[i]) { this.gateProgress.push(d); if (this.gateProgress.length === GATE_SEQ.length) { this.state = 'panel'; this.save = loadSave(); } }
+    else this.gateProgress = (d === GATE_SEQ[0]) ? [d] : [];
+  }
+  _adjustSfx(delta) { const s = loadSave(); const v = Math.max(0, Math.min(1, Math.round((s.settings.sfxVolume + delta) * 10) / 10)); this.save = updateSave({ settings: { ...s.settings, sfxVolume: v } }); setSfxVolume(v); }
+  _toggleVoiceMode() { const s = loadSave(); const v = s.settings.voiceMode === 'tts' ? 'file' : 'tts'; this.save = updateSave({ settings: { ...s.settings, voiceMode: v } }); setVoiceMode(v); }
+  _toggleNameDisplay() { const s = loadSave(); const v = s.settings.kanaNameDisplay === 'katakana' ? 'hiragana' : 'katakana'; this.save = updateSave({ settings: { ...s.settings, kanaNameDisplay: v } }); }
+  _adjustLen(delta) { const s = loadSave(); const v = Math.max(3, Math.min(8, (s.settings.sessionLength || 4) + delta)); this.save = updateSave({ settings: { ...s.settings, sessionLength: v } }); }
+  _doReset() { resetSave(); this.save = loadSave(); this._confirming = false; }
+
+  update() {}
+
+  _bg() {
+    const g = ctx.createLinearGradient(0, 0, 0, view.h);
+    g.addColorStop(0, '#c7d3e6'); g.addColorStop(1, '#eef1f7');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, view.w, view.h);
+  }
+
+  render() {
+    this._bg();
+    if (this.state === 'gate') this._renderGate(); else this._renderPanel();
+  }
+
+  _renderGate() {
+    label('おうちの かた専用', view.w / 2, view.h * 0.18, { size: Math.min(view.w * 0.05, 30), color: '#33415e', weight: 800 });
+    label('３ → １ → ５ の じゅんに おしてください', view.w / 2, view.h * 0.27, { size: Math.min(view.w * 0.038, 22), color: '#33415e', weight: 700 });
+    for (let i = 0; i < 3; i++) {
+      const cx = view.w / 2 + (i - 1) * 34, cy = view.h * 0.34;
+      ctx.beginPath(); ctx.arc(cx, cy, 8, 0, Math.PI * 2);
+      ctx.fillStyle = i < this.gateProgress.length ? '#33415e' : 'rgba(51,65,94,0.25)'; ctx.fill();
+    }
+    const cols = 3, size = Math.min(view.w * 0.16, 84), gap = size * 0.25;
+    const gridW = size * cols + gap * (cols - 1), gx0 = (view.w - gridW) / 2, gy0 = view.h * 0.42;
+    this.numButtons.forEach((b, i) => { const c = i % cols, r = Math.floor(i / cols); b.setRect(gx0 + c * (size + gap), gy0 + r * (size + gap), size, size); b.render(); });
+    this.backGate.setRect(view.w * 0.04, view.h * 0.04, Math.min(view.w * 0.24, 140), Math.min(view.h * 0.09, 50));
+    this.backGate.render();
+  }
+
+  _row(y) { return { y, x: view.w * 0.08, w: view.w * 0.84 }; }
+
+  _renderPanel() {
+    label('おうちのかたへ', view.w / 2, view.h * 0.09, { size: Math.min(view.w * 0.06, 34), color: '#243352', weight: 800 });
+    const stars = this.save.stars || 0;
+    const obtained = CATEGORY_ORDER.reduce((n, c) => n + (this.save.collection[c] || []).length, 0);
+    const totalAll = CATEGORY_ORDER.reduce((n, c) => n + SAMPLE_CREATURES[c].length, 0);
+    label(`⭐ ほし ${stars}こ　／　ずかん ${obtained}/${totalAll} しゅるい`, view.w / 2, view.h * 0.17, { size: Math.min(view.w * 0.038, 22), color: '#33415e', weight: 700 });
+    label('（もじ・カタカナ別の くわしい習得状況は 今後のアップデートで追加）', view.w / 2, view.h * 0.225, { size: Math.min(view.w * 0.026, 14), color: '#5a6a8a', weight: 500 });
+
+    const labelX = view.w * 0.08, rightX = view.w * 0.92;
+    const rows = [
+      { y: view.h * 0.32, text: `こうかおん おんりょう　${Math.round((this.save.settings.sfxVolume ?? 0.8) * 100)}%`, minus: this.sfxMinus, plus: this.sfxPlus },
+      { y: view.h * 0.42, text: `1かいの もんだいすう　${this.save.settings.sessionLength || 4}もん`, minus: this.lenMinus, plus: this.lenPlus },
+    ];
+    for (const r of rows) {
+      label(r.text, labelX, r.y, { size: Math.min(view.w * 0.032, 20), align: 'left', color: '#243352', weight: 700 });
+      const bs = Math.min(view.h * 0.075, 46);
+      r.minus.setRect(rightX - bs * 2.3, r.y - bs / 2, bs, bs); r.minus.render();
+      r.plus.setRect(rightX - bs, r.y - bs / 2, bs, bs); r.plus.render();
+    }
+    // トグル行（よみあげモード／表記）
+    this.voiceToggle.label = `よみあげ：${this.save.settings.voiceMode === 'tts' ? '合成音声' : 'ろくおん（準備中）'}`;
+    this.nameToggle.label = `なかまの表記：${this.save.settings.kanaNameDisplay === 'hiragana' ? 'ひらがな' : 'カタカナ'}`;
+    const tw = Math.min(view.w * 0.5, 320), th = Math.min(view.h * 0.075, 46);
+    this.voiceToggle.setRect(view.w * 0.08, view.h * 0.51, tw, th); this.voiceToggle.render();
+    this.nameToggle.setRect(view.w * 0.08, view.h * 0.60, tw, th); this.nameToggle.render();
+
+    // リセット
+    const rb = Math.min(view.h * 0.09, 54), rw = Math.min(view.w * 0.4, 260);
+    this.resetBtn.setRect((view.w - rw) / 2, view.h * 0.72, rw, rb); this.resetBtn.render();
+
+    if (this._confirming) {
+      const boxW = Math.min(view.w * 0.7, 440), boxH = view.h * 0.22, bx = (view.w - boxW) / 2, by = view.h * 0.5 - boxH / 2;
+      ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.97)'; ctx.strokeStyle = '#d9614f'; ctx.lineWidth = 3; rrPath(bx, by, boxW, boxH, 20); ctx.fill(); ctx.stroke(); ctx.restore();
+      label('ほんとうに リセットしますか？', view.w / 2, by + boxH * 0.28, { size: 20, color: '#243352', weight: 800 });
+      label('（ほし・ずかん・せっていが ぜんぶ きえます）', view.w / 2, by + boxH * 0.48, { size: 14, color: '#5a6a8a', weight: 600 });
+      const bw2 = boxW * 0.42, bh2 = boxH * 0.32, byB = by + boxH * 0.6;
+      this.resetYes.setRect(bx + boxW * 0.06, byB, bw2, bh2); this.resetYes.render();
+      this.resetNo.setRect(bx + boxW * 0.52, byB, bw2, bh2); this.resetNo.render();
+    }
+    this.backPanel.setRect(view.w * 0.04, view.h * 0.04, Math.min(view.w * 0.24, 140), Math.min(view.h * 0.09, 50));
+    this.backPanel.render();
+  }
+
+  onPointerDown(x, y) {
+    if (this.state === 'gate') {
+      if (this.backGate.hitTest(x, y)) { sfxTap(); this.backGate.tap(); return; }
+      for (const b of this.numButtons) if (b.hitTest(x, y)) { b.tap(); return; }
+      return;
+    }
+    if (this._confirming) {
+      if (this.resetYes.hitTest(x, y)) { sfxTap(); this.resetYes.tap(); return; }
+      if (this.resetNo.hitTest(x, y)) { sfxTap(); this.resetNo.tap(); return; }
+      return;
+    }
+    if (this.backPanel.hitTest(x, y)) { sfxTap(); this.backPanel.tap(); return; }
+    if (this.sfxMinus.hitTest(x, y)) { sfxTap(); this.sfxMinus.tap(); return; }
+    if (this.sfxPlus.hitTest(x, y)) { sfxTap(); this.sfxPlus.tap(); return; }
+    if (this.lenMinus.hitTest(x, y)) { sfxTap(); this.lenMinus.tap(); return; }
+    if (this.lenPlus.hitTest(x, y)) { sfxTap(); this.lenPlus.tap(); return; }
+    if (this.voiceToggle.hitTest(x, y)) { sfxTap(); this.voiceToggle.tap(); return; }
+    if (this.nameToggle.hitTest(x, y)) { sfxTap(); this.nameToggle.tap(); return; }
+    if (this.resetBtn.hitTest(x, y)) { sfxTap(); this.resetBtn.tap(); return; }
+  }
+}
+
+/* ===== core/input.js ===== */
+// core/input.js — Pointer Events（タッチ/マウス/ペン統一）を canvas に束縛し、
+// 内部座標へ正規化して現在シーンへ委譲。マルチタッチは最初の1点のみ採用（仕様§8.4）。
+// 副作用（リスナ登録）を持つので ORDER 上は canvas/scene-manager/audio/speech の後ろ。
+
+const pointer = { x: 0, y: 0, down: false, id: null };
+let primed = false;
+
+function unlockOnce() { initAudioOnce(); if (!primed) { primeSpeech(); primed = true; } }
+
+canvasEl.addEventListener('pointerdown', (e) => {
+  if (pointer.down) return;                 // 既に1点追跡中なら無視
+  unlockOnce();
+  try { canvasEl.setPointerCapture(e.pointerId); } catch (_) {}
+  pointer.down = true; pointer.id = e.pointerId;
+  const p = toInternal(e.clientX, e.clientY); pointer.x = p.x; pointer.y = p.y;
+  scenes.onPointerDown(p.x, p.y);
+  e.preventDefault();
+}, { passive: false });
+
+canvasEl.addEventListener('pointermove', (e) => {
+  if (!pointer.down || e.pointerId !== pointer.id) return;
+  const p = toInternal(e.clientX, e.clientY); pointer.x = p.x; pointer.y = p.y;
+  scenes.onPointerMove(p.x, p.y);
+  e.preventDefault();
+}, { passive: false });
+
+function endPointer(e) {
+  if (!pointer.down || (e.pointerId != null && e.pointerId !== pointer.id)) return;
+  const p = toInternal(e.clientX ?? pointer.x, e.clientY ?? pointer.y);
+  pointer.down = false; pointer.id = null;
+  scenes.onPointerUp(p.x, p.y);
+}
+canvasEl.addEventListener('pointerup', endPointer);
+canvasEl.addEventListener('pointercancel', endPointer);
+canvasEl.addEventListener('lostpointercapture', endPointer);
+canvasEl.addEventListener('contextmenu', (e) => e.preventDefault());
+
+/* ===== main.js ===== */
+// main.js — 起動エントリ。シーン登録 → UIボタン配線 → title 表示 → resize → ループ開始。
+// ORDER 上は最後。dev(ESM) では input.js を副作用 import して pointer リスナを確実に読み込む。
+
+// 保存済み設定を反映
+try { const sv = loadSave(); if (sv && sv.settings) setVoiceMode(sv.settings.voiceMode); } catch (_) {}
+
+// シーン登録（クラスは全て定義済み＝登録は最後にまとめて＝連結順に強い）
+scenes.register(SCENE.TITLE, new TitleScene());
+scenes.register(SCENE.HOME, new HomeScene());
+scenes.register(SCENE.LESSON, new LessonScene());
+scenes.register(SCENE.GAME_SELECT, new GameSelectScene());
+scenes.register(SCENE.REWARD, new RewardScene());
+scenes.register(SCENE.ZUKAN, new ZukanScene());
+scenes.register(SCENE.PARENT, new ParentScene());
+
+// 画面右上アイコン（build.shell.html 由来）
+const muteBtn = document.getElementById('muteBtn');
+if (muteBtn) muteBtn.addEventListener('click', () => {
+  initAudioOnce(); const m = toggleMute();
+  muteBtn.textContent = m ? '🔇' : '🔊'; muteBtn.setAttribute('aria-pressed', String(m));
+});
+const fsBtn = document.getElementById('fsBtn');
+if (fsBtn) fsBtn.addEventListener('click', () => {
+  const el = stageEl || canvasEl;
+  if (!document.fullscreenElement) { const f = el.requestFullscreen || el.webkitRequestFullscreen; if (f) { try { f.call(el); } catch (_) {} } }
+  else if (document.exitFullscreen) document.exitFullscreen();
+});
+
+loadAssets();
+scenes.set(SCENE.TITLE);
+resize();
+startLoop();
+
+})();
+</script>
+</body>
+</html>

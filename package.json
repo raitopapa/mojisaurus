@@ -1,0 +1,13 @@
+{
+  "name": "mojisaurus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "もじざうるす — ひらがな・カタカナが読める子ども向け国語ゲーム（Canvas 2D + ES Modules・単一ファイルビルド）",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "node scripts/serve.mjs",
+    "test": "node build.mjs && node test/smoke.mjs"
+  },
+  "engines": { "node": ">=18" }
+}
