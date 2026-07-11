@@ -4,7 +4,7 @@ import { COLORS, SCENE } from '../core/constants.js';
 import { view, ctx, label, rrPath } from '../core/canvas.js';
 import { scenes } from '../core/scene-manager.js';
 import { sfxTap } from '../core/audio.js';
-import { setSfxVolume } from '../core/audio.js';
+import { setSfxVolume, startBgm, stopBgm, setBgmVolume } from '../core/audio.js';
 import { setVoiceMode } from '../core/speech.js';
 import { loadSave, updateSave, resetSave } from '../core/storage.js';
 import { Button } from '../ui/button.js';
@@ -22,6 +22,9 @@ class ParentScene {
     this.backPanel = new Button({ label: 'もどる', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.HOME) });
     this.sfxMinus = new Button({ label: '－', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustSfx(-0.1) });
     this.sfxPlus = new Button({ label: '＋', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustSfx(0.1) });
+    this.bgmToggle = new Button({ label: '', fill: '#94a3c4', labelSize: 18, onTap: () => this._toggleBgm() });
+    this.bgmMinus = new Button({ label: '－', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustBgm(-0.1) });
+    this.bgmPlus = new Button({ label: '＋', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustBgm(0.1) });
     this.voiceToggle = new Button({ label: '', fill: '#94a3c4', labelSize: 18, onTap: () => this._toggleVoiceMode() });
     this.nameToggle = new Button({ label: '', fill: '#94a3c4', labelSize: 18, onTap: () => this._toggleNameDisplay() });
     this.lenMinus = new Button({ label: '－', fill: '#94a3c4', labelSize: 24, onTap: () => this._adjustLen(-1) });
@@ -38,6 +41,8 @@ class ParentScene {
     else this.gateProgress = (d === GATE_SEQ[0]) ? [d] : [];
   }
   _adjustSfx(delta) { const s = loadSave(); const v = Math.max(0, Math.min(1, Math.round((s.settings.sfxVolume + delta) * 10) / 10)); this.save = updateSave({ settings: { ...s.settings, sfxVolume: v } }); setSfxVolume(v); }
+  _toggleBgm() { const s = loadSave(); const on = !(s.settings.bgmOn !== false); this.save = updateSave({ settings: { ...s.settings, bgmOn: on } }); if (on) startBgm(); else stopBgm(); }
+  _adjustBgm(delta) { const s = loadSave(); const v = Math.max(0, Math.min(1, Math.round(((s.settings.bgmVolume ?? 0.35) + delta) * 10) / 10)); this.save = updateSave({ settings: { ...s.settings, bgmVolume: v } }); setBgmVolume(v); }
   _toggleVoiceMode() { const s = loadSave(); const v = s.settings.voiceMode === 'tts' ? 'file' : 'tts'; this.save = updateSave({ settings: { ...s.settings, voiceMode: v } }); setVoiceMode(v); }
   _toggleNameDisplay() { const s = loadSave(); const v = s.settings.kanaNameDisplay === 'katakana' ? 'hiragana' : 'katakana'; this.save = updateSave({ settings: { ...s.settings, kanaNameDisplay: v } }); }
   _adjustLen(delta) { const s = loadSave(); const v = Math.max(3, Math.min(8, (s.settings.sessionLength || 4) + delta)); this.save = updateSave({ settings: { ...s.settings, sessionLength: v } }); }
@@ -82,26 +87,30 @@ class ParentScene {
     label('（もじ・カタカナ別の くわしい習得状況は 今後のアップデートで追加）', view.w / 2, view.h * 0.225, { size: Math.min(view.w * 0.026, 14), color: '#5a6a8a', weight: 500 });
 
     const labelX = view.w * 0.08, rightX = view.w * 0.92;
+    const bgmOn = this.save.settings.bgmOn !== false;
     const rows = [
-      { y: view.h * 0.32, text: `こうかおん おんりょう　${Math.round((this.save.settings.sfxVolume ?? 0.8) * 100)}%`, minus: this.sfxMinus, plus: this.sfxPlus },
-      { y: view.h * 0.42, text: `1かいの もんだいすう　${this.save.settings.sessionLength || 4}もん`, minus: this.lenMinus, plus: this.lenPlus },
+      { y: view.h * 0.30, text: `BGM おんりょう　${bgmOn ? Math.round((this.save.settings.bgmVolume ?? 0.35) * 100) + '%' : 'オフ'}`, minus: this.bgmMinus, plus: this.bgmPlus, dim: !bgmOn },
+      { y: view.h * 0.39, text: `こうかおん おんりょう　${Math.round((this.save.settings.sfxVolume ?? 0.8) * 100)}%`, minus: this.sfxMinus, plus: this.sfxPlus },
+      { y: view.h * 0.48, text: `1かいの もんだいすう　${this.save.settings.sessionLength || 4}もん`, minus: this.lenMinus, plus: this.lenPlus },
     ];
     for (const r of rows) {
-      label(r.text, labelX, r.y, { size: Math.min(view.w * 0.032, 20), align: 'left', color: '#243352', weight: 700 });
+      label(r.text, labelX, r.y, { size: Math.min(view.w * 0.032, 20), align: 'left', color: r.dim ? '#8896b0' : '#243352', weight: 700 });
       const bs = Math.min(view.h * 0.075, 46);
       r.minus.setRect(rightX - bs * 2.3, r.y - bs / 2, bs, bs); r.minus.render();
       r.plus.setRect(rightX - bs, r.y - bs / 2, bs, bs); r.plus.render();
     }
-    // トグル行（よみあげモード／表記）
+    // トグル行（BGM ON/OFF ／ よみあげ ／ 表記）
+    this.bgmToggle.label = `BGM：${bgmOn ? 'オン' : 'オフ'}`;
     this.voiceToggle.label = `よみあげ：${this.save.settings.voiceMode === 'tts' ? '合成音声' : 'ろくおん（準備中）'}`;
     this.nameToggle.label = `なかまの表記：${this.save.settings.kanaNameDisplay === 'hiragana' ? 'ひらがな' : 'カタカナ'}`;
-    const tw = Math.min(view.w * 0.5, 320), th = Math.min(view.h * 0.075, 46);
-    this.voiceToggle.setRect(view.w * 0.08, view.h * 0.51, tw, th); this.voiceToggle.render();
-    this.nameToggle.setRect(view.w * 0.08, view.h * 0.60, tw, th); this.nameToggle.render();
+    const tw = Math.min(view.w * 0.5, 320), th = Math.min(view.h * 0.07, 44);
+    this.bgmToggle.setRect(view.w * 0.08, view.h * 0.545, tw, th); this.bgmToggle.render();
+    this.voiceToggle.setRect(view.w * 0.08, view.h * 0.625, tw, th); this.voiceToggle.render();
+    this.nameToggle.setRect(view.w * 0.08, view.h * 0.705, tw, th); this.nameToggle.render();
 
     // リセット
-    const rb = Math.min(view.h * 0.09, 54), rw = Math.min(view.w * 0.4, 260);
-    this.resetBtn.setRect((view.w - rw) / 2, view.h * 0.72, rw, rb); this.resetBtn.render();
+    const rb = Math.min(view.h * 0.08, 50), rw = Math.min(view.w * 0.4, 260);
+    this.resetBtn.setRect((view.w - rw) / 2, view.h * 0.80, rw, rb); this.resetBtn.render();
 
     if (this._confirming) {
       const boxW = Math.min(view.w * 0.7, 440), boxH = view.h * 0.22, bx = (view.w - boxW) / 2, by = view.h * 0.5 - boxH / 2;
@@ -130,6 +139,9 @@ class ParentScene {
     if (this.backPanel.hitTest(x, y)) { sfxTap(); this.backPanel.tap(); return; }
     if (this.sfxMinus.hitTest(x, y)) { sfxTap(); this.sfxMinus.tap(); return; }
     if (this.sfxPlus.hitTest(x, y)) { sfxTap(); this.sfxPlus.tap(); return; }
+    if (this.bgmMinus.hitTest(x, y)) { sfxTap(); this.bgmMinus.tap(); return; }
+    if (this.bgmPlus.hitTest(x, y)) { sfxTap(); this.bgmPlus.tap(); return; }
+    if (this.bgmToggle.hitTest(x, y)) { sfxTap(); this.bgmToggle.tap(); return; }
     if (this.lenMinus.hitTest(x, y)) { sfxTap(); this.lenMinus.tap(); return; }
     if (this.lenPlus.hitTest(x, y)) { sfxTap(); this.lenPlus.tap(); return; }
     if (this.voiceToggle.hitTest(x, y)) { sfxTap(); this.voiceToggle.tap(); return; }

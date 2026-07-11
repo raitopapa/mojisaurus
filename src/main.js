@@ -5,7 +5,7 @@ import { canvasEl, stageEl, resize } from './core/canvas.js';
 import { scenes } from './core/scene-manager.js';
 import { startLoop } from './core/game-loop.js';
 import { SCENE } from './core/constants.js';
-import { initAudioOnce, toggleMute } from './core/audio.js';
+import { initAudioOnce, toggleMute, startBgm, setBgmVolume } from './core/audio.js';
 import { setVoiceMode } from './core/speech.js';
 import { loadAssets } from './core/assets.js';
 import { loadSave } from './core/storage.js';
@@ -18,7 +18,15 @@ import { ZukanScene } from './scenes/zukan.js';
 import { ParentScene } from './scenes/parent.js';
 
 // 保存済み設定を反映
-try { const sv = loadSave(); if (sv && sv.settings) setVoiceMode(sv.settings.voiceMode); } catch (_) {}
+try {
+  const sv = loadSave();
+  if (sv && sv.settings) {
+    setVoiceMode(sv.settings.voiceMode);
+    setBgmVolume(sv.settings.bgmVolume ?? 0.35);
+    // BGM ON なら開始を予約（実際の再生は初回タップでの音声アンロック後）
+    if (sv.settings.bgmOn !== false) startBgm();
+  }
+} catch (_) {}
 
 // シーン登録（クラスは全て定義済み＝登録は最後にまとめて＝連結順に強い）
 scenes.register(SCENE.TITLE, new TitleScene());

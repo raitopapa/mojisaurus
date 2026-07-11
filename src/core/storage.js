@@ -8,7 +8,7 @@ function makeDefault() {
     eggProgress: 0,
     collection: { dino: [], insect: [], ghost: [] },
     mastery: {},
-    settings: { bgmOn: true, sfxVolume: 0.8, voiceMode: 'tts', sessionLength: 4, kanaNameDisplay: 'katakana' },
+    settings: { bgmOn: true, bgmVolume: 0.35, sfxVolume: 0.8, voiceMode: 'tts', sessionLength: 4, kanaNameDisplay: 'katakana' },
     lastPlayed: null,
   };
 }

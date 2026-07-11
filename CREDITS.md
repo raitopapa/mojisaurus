@@ -13,9 +13,16 @@
 - ひらがな・カタカナの筆順表示には **KanjiVG** を使用しています。
   - © Ulrich Apel / KanjiVG project — ライセンス: **Creative Commons BY-SA 3.0**
   - https://kanjivg.tagaini.net/
-  - 現在の収録範囲：し・く・こ・い の4字（`kanji/03057.svg`, `kanji/0304f.svg`, `kanji/03053.svg`, `kanji/03044.svg`）。
-    各SVGの `kvg:StrokePaths` 内のパス（`d`属性）をストローク順に抽出し、`viewBox="0 0 109 109"` のまま `src/data/sample-strokes.js` に格納。座標・形状の改変は行っていません。
-  - ひらがな・カタカナ全92字への拡張はBatch3で同じ手順により実施予定。
+  - 収録範囲：ひらがな清音46字＋カタカナ清音46字＝**全92字**（`kanji/{Unicodeコードポイント5桁16進}.svg`）。
+    各SVGの `kvg:StrokePaths` 内のパス（`d`属性）をストローク順に抽出し、`viewBox="0 0 109 109"` のまま `src/data/kana-data.js` に格納。座標・形状の改変は行っていません。
+  - 濁音・半濁音・拗音・促音・長音は対象外（仕様上、別の特殊音データとして今後扱う予定）。
+
+## イラスト素材（単語カード）
+- `assets/images/words/` 配下の動物・食べ物等のイラストは、生成AIで作成したオリジナル画像です。
+  実在の著作物（キャラクター・商標等）を模したものではありません。
+
+## 単語データ
+- `src/data/word-data.js` の単語選定・読みは本プロジェクトによるオリジナル編纂です。
 
 ## 素材
 - キャラクター（ガオ 等）・UI は本プロジェクトのオリジナル。既存IPの複製は行いません。

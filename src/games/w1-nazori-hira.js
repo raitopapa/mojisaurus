@@ -44,18 +44,20 @@ class W1NazoriHira extends GameBase {
     this.R = params.toleranceR || 26;
     this.strokeIndex = 0; this.cursor = 0; this.trail = [];
     this.mistakes = 0; this._strayCount = 0; this.tracing = false;
-    this.state = 'demo'; this.demoT = 0;
+    this.state = 'demo'; this.demoT = 0; this._demoStarted = false;
+    // 文字の音を強調：まず「し」だけをはっきり、続けて「と かくよ」を（前の発話を止めずに）繋げる
     this._speak(this.kana);
-    this._speakStrokeStart();
+    this._speak('と かくよ', { interrupt: false });
   }
 
-  _speak(text) { if (this.services.speech && this.services.speech.speak) this.services.speech.speak(text); }
+  _speak(text, o) { if (this.services.speech && this.services.speech.speak) this.services.speech.speak(text, o); }
   _sfx(name) { const a = this.services.audio; if (a && typeof a[name] === 'function') a[name](); }
   _speakStrokeStart() { this._speak(COUNT_WORDS[this.strokeIndex] || 'つぎ'); }
 
   update(dt) {
     if (this.state !== 'demo') return;
     const s = this.strokes[this.strokeIndex]; if (!s) return;
+    if (!this._demoStarted) { this._demoStarted = true; this._speak(COUNT_WORDS[this.strokeIndex] || 'いち', { interrupt: false }); }
     this.demoT += dt;
     if (this.demoT >= s.duration) {
       this.strokeIndex++;
