@@ -1,0 +1,19 @@
+# push / PR のたびに build + smoke テストを自動実行。
+# 既存の `npm test`（= node build.mjs && node test/smoke.mjs）をそのまま流すだけ。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm test
