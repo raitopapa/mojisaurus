@@ -4,7 +4,7 @@ import { COLORS, SCENE } from '../core/constants.js';
 import { view, ctx, label, rrPath } from '../core/canvas.js';
 import { scenes } from '../core/scene-manager.js';
 import { sfxTap } from '../core/audio.js';
-import { setSfxVolume, startBgm, stopBgm, setBgmVolume } from '../core/audio.js';
+import { setSfxVolume, startBgm, stopBgm, setBgmVolume, setBgmTrack } from '../core/audio.js';
 import { setVoiceMode } from '../core/speech.js';
 import { loadSave, updateSave, resetSave } from '../core/storage.js';
 import { Button } from '../ui/button.js';
@@ -14,6 +14,7 @@ const GATE_SEQ = [3, 1, 5];
 
 class ParentScene {
   enter() {
+    setBgmTrack('home');
     this.state = 'gate'; this.gateProgress = [];
     this.save = loadSave(); this._confirming = false;
     this.numButtons = [];

@@ -3,7 +3,7 @@
 import { COLORS, SCENE, STARS_PER_EGG } from '../core/constants.js';
 import { view, ctx, fillBg, label, rrPath } from '../core/canvas.js';
 import { scenes } from '../core/scene-manager.js';
-import { sfxTap } from '../core/audio.js';
+import { sfxTap, setBgmTrack } from '../core/audio.js';
 import { speak } from '../core/speech.js';
 import { loadSave } from '../core/storage.js';
 import { Button } from '../ui/button.js';
@@ -13,6 +13,7 @@ import { EggGauge } from '../ui/egg-gauge.js';
 class HomeScene {
   enter() {
     this.t = 0;
+    setBgmTrack('home');
     this.save = loadSave();
     this.gao = new Gao({ mood: 'normal' });
     this.egg = new EggGauge({ max: STARS_PER_EGG, value: this.save.eggProgress || 0 });
@@ -38,35 +39,52 @@ class HomeScene {
 
   _layout() {
     const W = view.w, H = view.h;
-    this.gao.x = W * 0.055; this.gao.y = H * 0.5; this.gao.size = Math.min(W * 0.045, 34);
-    const topPad = H * 0.165;
-    // 学習6ボタンを2列×3行（広い時）or 縦積み（狭い時）
-    const wide = W >= 640;
-    const cols = wide ? 2 : 1;
-    const bw = wide ? Math.min(W * 0.4, 340) : Math.min(W * 0.82, 460);
-    const bh = wide ? Math.min(H * 0.145, 92) : Math.min(H * 0.095, 62);
-    const gapX = wide ? Math.min(W * 0.05, 40) : 0;
-    const gapY = wide ? Math.min(H * 0.032, 20) : bh * 0.2;
+    // 1) 下段（ずかん・おうちのかた）を先にアンカー
+    const sh = Math.max(36, Math.min(H * 0.1, 56));
+    const sy = H - sh - Math.max(8, H * 0.025);
+    const sw = Math.min(W * 0.34, 240);
+    const sgap = Math.min(W * 0.05, 36);
+    const sx0 = (W - (sw * 2 + sgap)) / 2;
+    this.buttons[6].setRect(sx0, sy, sw, sh); this.buttons[6].labelSize = Math.max(14, Math.min(sh * 0.45, 24));
+    this.buttons[7].setRect(sx0 + sw + sgap, sy, sw, sh); this.buttons[7].labelSize = Math.max(12, Math.min(sh * 0.4, 20));
+    // 2) 学習6ボタン：ゲージ下〜下段上の「利用可能な高さ」から逆算してはみ出しゼロに
+    const gridTop = H * 0.175;
+    const gridBottom = sy - Math.max(8, H * 0.02);
+    const availH = Math.max(60, gridBottom - gridTop);
+    const cols = (W / H > 2.1 && W >= 900) ? 3 : 2;   // 超横長のみ3列
+    const rows = Math.ceil(6 / cols);
+    const gapY = Math.max(6, Math.min(H * 0.028, 16));
+    const bh = Math.min((availH - gapY * (rows - 1)) / rows, 96);
+    const gapX = Math.min(W * 0.04, 32);
+    const bw = Math.min((W * 0.94 - gapX * (cols - 1)) / cols, 360);
     const gridW = bw * cols + gapX * (cols - 1);
     const x0 = (W - gridW) / 2;
     for (let i = 0; i < 6; i++) {
       const col = i % cols, row = Math.floor(i / cols);
-      const x = x0 + col * (bw + gapX), y = topPad + row * (bh + gapY);
-      this.buttons[i].setRect(x, y, bw, bh); this.buttons[i].labelSize = wide ? 26 : 22;
+      this.buttons[i].setRect(x0 + col * (bw + gapX), gridTop + row * (bh + gapY), bw, bh);
+      const len = Math.max(2, this._meta[i].label.replace('・', '').length);
+      this.buttons[i].labelSize = Math.max(13, Math.min(bh * 0.42, (bw * 0.9) / len));
     }
-    // 下段：ずかん・おうちのかた
-    const sw = Math.min(W * 0.32, 240), sh = Math.min(H * 0.085, 54);
-    const sy = H - sh - H * 0.028, sgap = Math.min(W * 0.06, 40);
-    const totalW = sw * 2 + sgap, sx0 = (W - totalW) / 2;
-    this.buttons[6].setRect(sx0, sy, sw, sh); this.buttons[6].labelSize = 24;
-    this.buttons[7].setRect(sx0 + sw + sgap, sy, sw, sh); this.buttons[7].labelSize = 20;
+    // 3) ガオ：ヘッダ帯の左（ゲージと重ならない位置に小さく）
+    this.gao.size = Math.min(W * 0.04, H * 0.06, 28);
+    this.gao.x = Math.max(this.gao.size + 6, W * 0.06);
+    this.gao.y = H * 0.075;
   }
 
   drawEggGauge() {
-    const W = view.w, H = view.h, bw = Math.min(W * 0.6, 460), bh = 24, x = (W - bw) / 2, y = H * 0.075;
-    label('たまごまで', x - 8, y + bh / 2, { size: 20, align: 'right', color: COLORS.ink, weight: 800 });
-    this.egg.render(x, y, bw, bh);
-    label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + bh + 20, { size: 17, color: COLORS.ink, weight: 700 });
+    const W = view.w, H = view.h;
+    const bh = Math.max(14, Math.min(24, H * 0.045));
+    const bw = Math.min(W * 0.58, 460), x = (W - bw) / 2, y = Math.max(12, H * 0.045);
+    const narrow = x < 110;   // 左にラベルを置く余白がない
+    if (narrow) {
+      label('たまごまで', W / 2, y - 2, { size: Math.min(14, bh * 0.7), color: COLORS.ink, weight: 800 });
+      this.egg.render(x, y + 8, bw, bh);
+      label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + 8 + bh + 13, { size: Math.min(14, bh * 0.65), color: COLORS.ink, weight: 700 });
+    } else {
+      label('たまごまで', x - 8, y + bh / 2, { size: Math.min(20, bh * 0.85), align: 'right', color: COLORS.ink, weight: 800 });
+      this.egg.render(x, y, bw, bh);
+      label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + bh + 15, { size: Math.min(16, bh * 0.7), color: COLORS.ink, weight: 700 });
+    }
   }
 
   _layoutOverlay() {

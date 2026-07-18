@@ -55,6 +55,15 @@ function label(txt, x, y, o = {}) {
   ctx.restore();
 }
 
+// 実測テキスト幅（label と同一フォント設定で measureText）。フォント差・端末差に依存しないレイアウト用。
+function textWidth(txt, size, weight) {
+  ctx.save();
+  ctx.font = `${weight || 800} ${size || 28}px ${FONT}`;
+  const w = ctx.measureText(txt).width;
+  ctx.restore();
+  return w;
+}
+
 // ふんわり角丸ボタン（押下時 pressed で少し沈む）
 function pill(rect, o = {}) {
   const p = o.pressed ? 3 : 0;
@@ -111,4 +120,4 @@ function drawGao(x, y, size, mood = 'normal') {
   ctx.restore();
 }
 
-export { FONT, canvasEl, ctx, stageEl, view, resize, toInternal, rrPath, label, pill, fillBg, drawGao };
+export { FONT, canvasEl, ctx, stageEl, view, resize, toInternal, rrPath, label, textWidth, pill, fillBg, drawGao };

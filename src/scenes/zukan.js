@@ -4,7 +4,7 @@ import { COLORS, SCENE } from '../core/constants.js';
 import { view, ctx, fillBg, label, rrPath } from '../core/canvas.js';
 import { pointInRect } from '../core/utils.js';
 import { scenes } from '../core/scene-manager.js';
-import { sfxTap } from '../core/audio.js';
+import { sfxTap , setBgmTrack } from '../core/audio.js';
 import { speak } from '../core/speech.js';
 import { loadSave } from '../core/storage.js';
 import { Button } from '../ui/button.js';
@@ -15,6 +15,7 @@ const TAB_FILL = { dino: COLORS.btnKaku, insect: COLORS.btnKotoba, ghost: COLORS
 
 class ZukanScene {
   enter() {
+    setBgmTrack('home');
     this.save = loadSave(); this.tab = 'dino';
     this.tabButtons = CATEGORY_ORDER.map(cat => new Button({ label: CATEGORY_LABEL[cat], fill: TAB_FILL[cat], labelSize: 22, onTap: () => { this.tab = cat; } }));
     this.backBtn = new Button({ label: 'もどる', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.HOME) });
