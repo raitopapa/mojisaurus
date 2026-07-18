@@ -1,17 +1,17 @@
-// games/g2-maze.js — 【G2】もじめいろ。指でなぞって進む迷路。分岐3箇所で
-// 「正しい形」vs「まちがい形（鏡文字 or にてる別の字）」を提示し、正しい方へ進めばゴール。
-// ・道はエッジグラフ（本線＋各分岐のハズレ袋小路）。カーソルはW1同様の寛容な追従（前進/後退可）。
-// ・ハズレの終端に着いたら優しく戻す（ミスカウント）。音声で「つぎは『し』だよ」と目標を告げる。
-// ・まちがい形：50%で鏡文字（KanjiVGストロークをx反転＝新データ不要で正確）、50%でにてる字（confusables）。
+// games/g2-maze.js — 【G2】もじめいろ。ことば（2〜4文字）の字を分岐で1つずつ集めながらゴールを目指す。
+// ・分岐ごとに「正しい形」vs「まちがい形（鏡文字 or にてる別の字）」。正しい方だけが先へ続く。
+// ・正解ルートの字をつなぐと1つの ことば になり、ゴールで絵カード（絵文字＋単語）を披露＆読み上げ。
+// ・迷路の形は毎回ランダム生成（分岐位置・上下・曲がり・袋小路の向きにジッター）＝同じパターンにならない。
+// ・道はエッジグラフ（E0→F1→C1→…→Cn→GOAL、各Fkにハズレ Wk）。カーソルはW1同様の寛容な窓式追従。
 import { GameBase } from './game-base.js';
-import { view, ctx, label, rrPath } from '../core/canvas.js';
+import { view, ctx, label, rrPath, drawGao } from '../core/canvas.js';
 import { parsePathD, flattenCommands, parseViewBox } from '../core/svg-path.js';
 import { KANA_DATA } from '../data/kana-data.js';
-import { HIRA_CONFUSE, KATA_CONFUSE } from '../data/confusables.js';
+import { HIRA_CONFUSE } from '../data/confusables.js';
+import { VOCAB_HIRA } from '../data/vocab-words.js';
 
 const R = 30;                 // 追従許容半径
 const CORRIDOR = 40;          // 道の太さ
-const FORKS = 3;
 
 function densify(pts, spacing = 10) {
   const out = [pts[0]];
@@ -24,43 +24,64 @@ function densify(pts, spacing = 10) {
   return out;
 }
 
-// 迷路の形（正規化座標）。本線: E0→(F1)→C1→(F2)→C2→(F3)→C3→GOAL。各Fiにハズレ Wi（袋小路）。
-function buildGeometry(W, H) {
-  const P = (x, y) => ({ x: W * x, y: H * y });
-  const edges = [
-    { id: 'E0', from: 'S',  to: 'F1', pts: [P(.08, .60), P(.24, .60)] },
-    { id: 'C1', from: 'F1', to: 'F2', pts: [P(.24, .60), P(.24, .32), P(.44, .32)], correct: true },
-    { id: 'W1', from: 'F1', to: 'D1', pts: [P(.24, .60), P(.24, .86), P(.40, .86)], correct: false },
-    { id: 'C2', from: 'F2', to: 'F3', pts: [P(.44, .32), P(.62, .32), P(.62, .60)], correct: true },
-    { id: 'W2', from: 'F2', to: 'D2', pts: [P(.44, .32), P(.52, .14), P(.68, .14)], correct: false },
-    { id: 'C3', from: 'F3', to: 'G',  pts: [P(.62, .60), P(.80, .60), P(.80, .36), P(.92, .36)], correct: true },
-    { id: 'W3', from: 'F3', to: 'D3', pts: [P(.62, .60), P(.62, .86), P(.78, .86)], correct: false },
-  ].map(e => ({ ...e, pts: densify(e.pts) }));
-  const forks = {
-    F1: { correct: 'C1', wrong: 'W1' },
-    F2: { correct: 'C2', wrong: 'W2' },
-    F3: { correct: 'C3', wrong: 'W3' },
-  };
-  return { edges, forks, forkOrder: ['F1', 'F2', 'F3'] };
+const rr = (a, b) => a + Math.random() * (b - a);
+const SMALLS = /[っゃゅょ]/;
+
+// お題の ことば：2〜4文字・基本かなのみ（迷路の分岐数＝文字数になる）
+function pickWord() {
+  const cands = VOCAB_HIRA.filter(x => x.w.length >= 2 && x.w.length <= 4 && /^[ぁ-ん]+$/.test(x.w) && !SMALLS.test(x.w));
+  return cands[Math.floor(Math.random() * cands.length)];
 }
 
-function pickTargets() {
-  // ひらがな・カタカナ混合で3文字（にてる字対応表にある字を優先＝間違い形のバリエーション確保）
-  const pool = [];
-  for (const k of Object.keys(HIRA_CONFUSE)) pool.push({ kana: k, pool: 'hiragana' });
-  for (const k of Object.keys(KATA_CONFUSE)) pool.push({ kana: k, pool: 'katakana' });
-  const out = [];
-  const used = new Set();
-  while (out.length < FORKS && pool.length) {
-    const i = Math.floor(Math.random() * pool.length);
-    const t = pool.splice(i, 1)[0];
-    if (used.has(t.kana)) continue;
-    used.add(t.kana);
-    const conf = t.pool === 'hiragana' ? HIRA_CONFUSE[t.kana] : KATA_CONFUSE[t.kana];
-    const useMirror = Math.random() < 0.5 || !conf;
-    out.push({ ...t, wrongKind: useMirror ? 'mirror' : 'confuse', wrongKana: useMirror ? t.kana : conf });
+// 迷路の形を毎回ランダム生成。バンド y∈[0.30,0.86]、x∈[0.07,0.90]。
+// 分岐Fkから：正解枝Ck＝縦（ジッター付きレーンへ）→横で次のFk+1（最終はGOAL）、ハズレWk＝逆側レーンへ落ちて袋小路。
+function buildGeometry(W, H, forks) {
+  const yMin = 0.30, yMax = 0.86;
+  const clampY = (v) => Math.max(yMin, Math.min(yMax, v));
+  const P = (x, y) => ({ x: W * x, y: H * y });
+  const edges = [];
+  const forkMap = {};
+  const forkOrder = [];
+
+  const x0 = rr(0.06, 0.09);
+  let fy = rr(0.45, 0.70);                       // スタートの高さもランダム
+  let fx = rr(0.19, 0.24);
+  edges.push({ id: 'E0', from: 'S', to: 'F1', pts: [P(x0, fy), P((x0 + fx) / 2, clampY(fy + rr(-0.06, 0.06))), P(fx, fy)] });
+
+  const stepX = (0.90 - fx) / forks;               // 残り幅を分岐数で分割
+  for (let k = 1; k <= forks; k++) {
+    const fid = `F${k}`;
+    forkOrder.push(fid);
+    const dir = Math.random() < 0.5 ? -1 : 1;      // 正解が上か下かは毎回ランダム
+    const laneC = clampY(fy + dir * rr(0.20, 0.30));
+    const laneW = clampY(fy - dir * rr(0.18, 0.28));
+    const nx = Math.min(0.90, fx + stepX * rr(0.85, 1.05));
+    const isLast = k === forks;
+    // 正解枝：縦→横（最後の分岐はGOALへ、途中に軽いジッター曲げ）
+    const cPts = [P(fx, fy), P(fx, laneC)];
+    if (!isLast) {
+      if (Math.random() < 0.5) cPts.push(P((fx + nx) / 2, clampY(laneC + rr(-0.05, 0.05))));
+      cPts.push(P(nx, laneC));
+    } else {
+      cPts.push(P(rr(0.86, 0.90), laneC));
+    }
+    edges.push({ id: `C${k}`, from: fid, to: isLast ? 'G' : `F${k + 1}`, pts: cPts, correct: true });
+    // ハズレ枝：逆レーンに落ちて短い袋小路（尻尾の向きもランダム）
+    const tail = rr(0.05, 0.09) * (Math.random() < 0.5 ? 1 : -1);
+    edges.push({ id: `W${k}`, from: fid, to: `D${k}`, pts: [P(fx, fy), P(fx, laneW), P(Math.min(0.9, Math.max(0.08, fx + Math.abs(tail))), clampY(laneW + tail * 0.5))], correct: false });
+    forkMap[fid] = { correct: `C${k}`, wrong: `W${k}` };
+    fx = nx; fy = laneC;
   }
-  return out;
+  return { edges: edges.map(e => ({ ...e, pts: densify(e.pts) })), forks: forkMap, forkOrder };
+}
+
+// ことばの各文字 → 分岐のお題（まちがい形は 50% 鏡文字／にてる字があれば 50% でそれ）
+function targetsFromWord(word) {
+  return [...word].map(kana => {
+    const conf = HIRA_CONFUSE[kana];
+    const useMirror = Math.random() < 0.5 || !conf;
+    return { kana, pool: 'hiragana', wrongKind: useMirror ? 'mirror' : 'confuse', wrongKana: useMirror ? kana : conf };
+  });
 }
 
 // KanjiVGストロークから字をミニ描画。mirror=true で左右反転（x' = vbW - x）。
@@ -83,15 +104,16 @@ function drawKana(kana, pool, cx, cy, size, mirror, color) {
 class G2Maze extends GameBase {
   init(ctx2, services) {
     this.services = services || {};
-    this.geo = buildGeometry(view.w, view.h);
-    this.targets = pickTargets();                       // forkOrder に対応
+    this.word = pickWord();                             // 正解ルートで完成する ことば
+    this.targets = targetsFromWord(this.word.w);        // forkOrder に対応（分岐数＝文字数）
+    this.geo = buildGeometry(view.w, view.h, this.targets.length);
+    this.collected = [];                                // 集めた字
     this.pos = { kind: 'edge', edgeId: 'E0', idx: 0 };  // kind: edge | fork
-    this.trail = [];                                    // 通過済み {edgeId, uptoIdx} の集合（描画用）
     this.progress = {};                                 // edgeId → 最深到達idx
     this.forksPassed = 0; this.mistakes = 0; this.itemsPracticed = [];
     this.done = false; this.tracing = false;
-    this._announcedFork = null; this._fxT = 0; this._msg = null;
-    this._speak('めいろ すたーと！ ゆびで なぞって すすもう');
+    this._announcedFork = null; this._msg = null; this._goalT = 0;
+    this._speak('もじを あつめて ゴールを めざそう！');
   }
 
   _speak(t, o) { const s = this.services.speech; if (s && s.speak) s.speak(t, o); }
@@ -99,13 +121,16 @@ class G2Maze extends GameBase {
   _edge(id) { return this.geo.edges.find(e => e.id === id); }
   _forkTarget(forkId) { return this.targets[this.geo.forkOrder.indexOf(forkId)]; }
 
-  update(dt) { if (this._msg) { this._msg.t += dt; if (this._msg.t > 1.6) this._msg = null; } }
+  update(dt) {
+    if (this._msg) { this._msg.t += dt; if (this._msg.t > 1.6) this._msg = null; }
+    if (this.done) this._goalT += dt;
+  }
 
   _announce(forkId) {
     if (this._announcedFork === forkId) return;
     this._announcedFork = forkId;
     const t = this._forkTarget(forkId);
-    this._speak(`つぎは 「${t.kana}」 だよ！ ただしい かたちへ すすもう`);
+    this._speak(`つぎは 「${t.kana}」 だよ！`);
   }
 
   onPointerDown(x, y) { this.tracing = true; this._advance(x, y); }
@@ -115,22 +140,25 @@ class G2Maze extends GameBase {
   _advance(x, y) {
     if (this.done) return;
     if (this.pos.kind === 'fork') {
+      // 両枝の入口候補（各枝の先頭1〜3点）から「指に最も近い点」を選ぶ。
+      // 固定順で判定すると分岐直後の重なり領域で意図しない枝に吸い付くため、必ず最近傍で決める。
       const fk = this.geo.forks[this.pos.forkId];
+      let best = null;
       for (const eid of [fk.correct, fk.wrong]) {
         const e = this._edge(eid);
         for (let k = 1; k <= 3 && k < e.pts.length; k++) {
-          if (Math.hypot(x - e.pts[k].x, y - e.pts[k].y) <= R) {
-            this.pos = { kind: 'edge', edgeId: eid, idx: k };
-            this.progress[eid] = Math.max(this.progress[eid] || 0, k);
-            return;
-          }
+          const d = Math.hypot(x - e.pts[k].x, y - e.pts[k].y);
+          if (d <= R && (!best || d < best.d)) best = { eid, k, d };
         }
+      }
+      if (best) {
+        this.pos = { kind: 'edge', edgeId: best.eid, idx: best.k };
+        this.progress[best.eid] = Math.max(this.progress[best.eid] || 0, best.k);
       }
       return;
     }
     const e = this._edge(this.pos.edgeId);
-    // カーソル更新：現在idxの前後K点の窓の中で「指に最も近い点」へ移動（1回の呼び出しで1回だけ更新＝振動しない）。
-    // 前進も後退も自然にできる。R より遠ければ動かない（道から外れた指は無視）。
+    // 窓式カーソル：現在idxの前後K点で指に最も近い点へ（前進も後退も自然・振動しない）
     const K = 4;
     let bestK = this.pos.idx, bestD = Infinity;
     for (let k = Math.max(0, this.pos.idx - K); k <= Math.min(e.pts.length - 1, this.pos.idx + K); k++) {
@@ -141,24 +169,29 @@ class G2Maze extends GameBase {
     this.progress[e.id] = Math.max(this.progress[e.id] || 0, this.pos.idx);
 
     if (this.pos.idx <= 0 && e.from.startsWith('F')) {
-      // 分岐まで戻った → 選び直し
       this.pos = { kind: 'fork', forkId: e.from };
       return;
     }
     if (this.pos.idx >= e.pts.length - 1) {
-      // エッジ終端に到達
       if (e.to === 'G') {
-        if (e.correct) { this.forksPassed++; this.itemsPracticed.push(this._forkTarget(e.from).kana); }
-        this.done = true; this._sfx('sfxSparkle'); this._speak('ゴール！ めいろ だいせいこう！'); return;
+        if (e.correct) { this.forksPassed++; const t = this._forkTarget(e.from); this.collected.push(t.kana); this.itemsPracticed.push(t.kana); }
+        this.done = true; this._sfx('sfxSparkle');
+        this._speak(`ゴール！ ${this.word.w}、かんせい！`);
+        return;
       }
       if (e.to.startsWith('F')) {
-        if (e.correct) { this.forksPassed++; this.itemsPracticed.push(this._forkTarget(e.from).kana); this._sfx('sfxCorrect'); }
+        if (e.correct) {
+          this.forksPassed++;
+          const t = this._forkTarget(e.from);
+          this.collected.push(t.kana); this.itemsPracticed.push(t.kana);
+          this._sfx('sfxCorrect');
+          this._speak(`「${t.kana}」 げっと！`, { interrupt: false });
+        }
         this.pos = { kind: 'fork', forkId: e.to };
         this._announce(e.to);
         return;
       }
       if (e.to.startsWith('D')) {
-        // ハズレ袋小路 → 優しく分岐へ戻す
         this.mistakes++;
         this._sfx('sfxWrong');
         this._msg = { text: 'あれれ、こっちは ちがう じ！', t: 0 };
@@ -168,10 +201,10 @@ class G2Maze extends GameBase {
       }
     }
   }
+
   _labelPosFor(edgeId) {
     const e = this._edge(edgeId);
     const p = e.pts[Math.min(8, e.pts.length - 1)];
-    // ラベルは分岐直後の点から、進行方向の外側に少し出す
     const p0 = e.pts[0];
     const dx = p.x - p0.x, dy = p.y - p0.y, len = Math.hypot(dx, dy) || 1;
     return { x: p.x + (dx / len) * 22, y: p.y + (dy / len) * 22 };
@@ -179,7 +212,7 @@ class G2Maze extends GameBase {
 
   render() {
     const W = view.w, H = view.h;
-    // 道（全エッジ：下地→通過分を色付け）
+    // 道（下地→通過分）
     for (const e of this.geo.edges) {
       ctx.save(); ctx.strokeStyle = '#f5efdf'; ctx.lineWidth = CORRIDOR; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
       this._poly(e.pts); ctx.stroke();
@@ -198,16 +231,16 @@ class G2Maze extends GameBase {
     // スタート/ゴール
     const s0 = this._edge('E0').pts[0];
     label('🐣', s0.x - 26, s0.y, { size: 30 });
-    const gEdge = this._edge('C3'); const gp = gEdge.pts[gEdge.pts.length - 1];
-    label('🥚', gp.x + 26, gp.y, { size: 32 });
-    label('ゴール', gp.x + 26, gp.y + 30, { size: 14, color: '#2b3a67', weight: 700 });
-    // 分岐の文字（正しい形＝正解エッジ側、まちがい形＝ハズレ側）
+    const gEdge = this._edge(`C${this.targets.length}`); const gp = gEdge.pts[gEdge.pts.length - 1];
+    label('🥚', gp.x + 24, gp.y, { size: 32 });
+    label('ゴール', gp.x + 24, gp.y + 28, { size: 13, color: '#2b3a67', weight: 700 });
+    // 分岐の字（正しい形＝正解エッジ側、まちがい形＝ハズレ側）
     this.geo.forkOrder.forEach((fid, i) => {
       const t = this.targets[i];
       const fk = this.geo.forks[fid];
       const cp = this._labelPosFor(fk.correct);
       const wp = this._labelPosFor(fk.wrong);
-      const size = Math.min(W, H) * 0.11;
+      const size = Math.min(W, H) * 0.105;
       this._badge(cp.x, cp.y, size);
       drawKana(t.kana, t.pool, cp.x, cp.y, size * 0.72, false, '#2b3a67');
       this._badge(wp.x, wp.y, size);
@@ -218,21 +251,53 @@ class G2Maze extends GameBase {
     const cur = this._curPoint();
     ctx.save(); ctx.fillStyle = 'rgba(255,197,58,0.95)'; ctx.beginPath(); ctx.arc(cur.x, cur.y, 13, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke(); ctx.restore();
-    // お題表示（現在の分岐 or ゴール文言）
-    if (this.done) {
-      label('ゴール！ 🎉', W / 2, H * 0.12, { size: Math.min(W * 0.05, 30), color: '#2b3a67', weight: 800 });
-    } else {
-      const fid = this.pos.kind === 'fork' ? this.pos.forkId : null;
-      const nextFork = fid || this._nextForkAhead();
-      if (nextFork) {
-        const t = this._forkTarget(nextFork);
-        label(`つぎは 「${t.kana}」！`, W / 2, H * 0.12, { size: Math.min(W * 0.045, 26), color: '#2b3a67', weight: 800 });
+    // 上部：お題＋あつめた字（？ボックス）
+    if (!this.done) {
+      const fid = this.pos.kind === 'fork' ? this.pos.forkId : this._nextForkAhead();
+      if (fid) {
+        const t = this._forkTarget(fid);
+        label(`つぎは 「${t.kana}」！`, W / 2, H * 0.115, { size: Math.min(W * 0.042, 24), color: '#2b3a67', weight: 800 });
       }
     }
+    this._renderCollected(W, H);
     if (this._msg) {
       const a = Math.max(0, 1 - this._msg.t / 1.6);
-      label(this._msg.text, W / 2, H * 0.19, { size: 20, color: `rgba(200,70,60,${a.toFixed(2)})`, weight: 800 });
+      label(this._msg.text, W / 2, H * 0.245, { size: 19, color: `rgba(200,70,60,${a.toFixed(2)})`, weight: 800 });
     }
+    // ゴール演出：ことばの絵カード
+    if (this.done) this._renderGoalCard(W, H);
+  }
+
+  _renderCollected(W, H) {
+    // 「あつめた じ」ボックス列：未取得は ？
+    const n = this.targets.length;
+    const s = Math.min(W * 0.055, H * 0.075, 34);
+    const gap = s * 0.25;
+    const total = n * s + (n - 1) * gap;
+    let x = (W - total) / 2;                          // 上部中央（お題の直下・通路帯 y≥0.30H と被らない）
+    const y = H * 0.165;
+    for (let i = 0; i < n; i++) {
+      ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.strokeStyle = i < this.collected.length ? '#57c06a' : '#c9d5ea'; ctx.lineWidth = 3;
+      rrPath(x, y, s, s, 8); ctx.fill(); ctx.stroke(); ctx.restore();
+      label(i < this.collected.length ? this.collected[i] : '？', x + s / 2, y + s / 2, { size: s * 0.6, color: i < this.collected.length ? '#2b3a67' : '#a6b2c8', weight: 800 });
+      x += s + gap;
+    }
+  }
+
+  _renderGoalCard(W, H) {
+    const t = Math.min(1, this._goalT / 0.35);
+    const ease = 1 - Math.pow(1 - t, 3);
+    ctx.save(); ctx.fillStyle = `rgba(255,255,255,${(0.55 * ease).toFixed(2)})`; ctx.fillRect(0, 0, W, H); ctx.restore();
+    const bw = Math.min(W * 0.6, 420) * (0.7 + 0.3 * ease), bh = Math.min(H * 0.52, 300) * (0.7 + 0.3 * ease);
+    const bx = (W - bw) / 2, by = (H - bh) / 2;
+    ctx.save(); ctx.globalAlpha = ease;
+    ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#57c06a'; ctx.lineWidth = 5;
+    rrPath(bx, by, bw, bh, 24); ctx.fill(); ctx.stroke();
+    label(this.word.e, W / 2, by + bh * 0.34, { size: bh * 0.34 });
+    label(this.word.w, W / 2, by + bh * 0.66, { size: Math.min(bh * 0.17, bw * 0.9 / Math.max(2, this.word.w.length)), color: '#2b3a67', weight: 800 });
+    label('もじを つないだら できた！ 🎉', W / 2, by + bh * 0.86, { size: Math.min(bh * 0.075, 17), color: '#2b3a67', weight: 700 });
+    ctx.restore();
+    drawGao(bx + bw * 0.06, by - 8, Math.min(W * 0.05, 38), 'happy');
   }
 
   _nextForkAhead() {

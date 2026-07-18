@@ -237,6 +237,15 @@ function label(txt, x, y, o = {}) {
   ctx.restore();
 }
 
+// 実測テキスト幅（label と同一フォント設定で measureText）。フォント差・端末差に依存しないレイアウト用。
+function textWidth(txt, size, weight) {
+  ctx.save();
+  ctx.font = `${weight || 800} ${size || 28}px ${FONT}`;
+  const w = ctx.measureText(txt).width;
+  ctx.restore();
+  return w;
+}
+
 // ふんわり角丸ボタン（押下時 pressed で少し沈む）
 function pill(rect, o = {}) {
   const p = o.pressed ? 3 : 0;
@@ -336,17 +345,47 @@ function toggleMute() { muted = !muted; if (master) master.gain.value = muted ? 
 function isMuted() { return muted; }
 function setSfxVolume(v) { sfxVolume = Math.max(0, Math.min(1, v)); if (sfxGain) sfxGain.gain.value = sfxVolume; }
 
-// ===== BGM（合成音・やさしいループ。音源ファイル不要）=====
-// C→G→Am→F 進行の4小節を、控えめな三角波のベース＋やわらかいメロディで淡々とループ。
-let _bgmWanted = false, _bgmTimer = null, _bgmNextTime = 0, _bgmStep = 0;
-const _BEAT = 0.5;  // 1拍の秒数（テンポ ≒ 120bpm だが音は伸ばして眠くならない程度に穏やか）
-// 各小節：ベース音(Hz)と、その小節で使うメロディ音の候補
-const _BGM_BARS = [
-  { bass: 130.81, mel: [523.25, 659.25, 783.99] },  // C
-  { bass: 196.00, mel: [587.33, 783.99, 587.33] },  // G
-  { bass: 220.00, mel: [523.25, 659.25, 880.00] },  // Am
-  { bass: 174.61, mel: [698.46, 523.25, 659.25] },  // F
-];
+// ===== BGM（合成音・シーン別ループ。音源ファイル不要）=====
+// setBgmTrack(name) でトラック切替（曲中でも次の拍から自然に切り替わる）。
+// 各トラック: beat=1拍の秒数, bars=4小節（bass基音＋拍ごとのメロディ）, drums=キック/ハット, stab=裏拍の和音スタブ(ポップ感)。
+let _bgmWanted = false, _bgmTimer = null, _bgmNextTime = 0, _bgmStep = 0, _bgmTrack = 'home';
+const _BGM_TRACKS = {
+  // ホーム：やさしい C-G-Am-F（従来曲）
+  home: { beat: 0.5, drums: false, stab: false, mvol: 0.06, bars: [
+    { bass: 130.81, mel: [523.25, 659.25, 783.99] },
+    { bass: 196.00, mel: [587.33, 783.99, 587.33] },
+    { bass: 220.00, mel: [523.25, 659.25, 880.00] },
+    { bass: 174.61, mel: [698.46, 523.25, 659.25] },
+  ] },
+  // タイトル：あかるいファンファーレ調
+  title: { beat: 0.42, drums: true, stab: false, mvol: 0.07, bars: [
+    { bass: 174.61, mel: [698.46, 880.00, 1046.5, 880.00] },
+    { bass: 196.00, mel: [783.99, 987.77, 1174.7, 987.77] },
+    { bass: 130.81, mel: [1046.5, 783.99, 659.25, 783.99] },
+    { bass: 196.00, mel: [987.77, 1174.7, 1568.0, 1174.7] },
+  ] },
+  // かく（W1）：おちついた集中系
+  focus: { beat: 0.62, drums: false, stab: false, mvol: 0.05, bars: [
+    { bass: 146.83, mel: [587.33, 698.46] },
+    { bass: 110.00, mel: [440.00, 523.25] },
+    { bass: 174.61, mel: [698.46, 880.00] },
+    { bass: 130.81, mel: [523.25, 659.25] },
+  ] },
+  // ことばあそび系（しりとり/なかま/もじならべ）：はずむポップ
+  pop: { beat: 0.30, drums: true, stab: true, mvol: 0.065, bars: [
+    { bass: 130.81, mel: [523.25, 659.25, 783.99, 659.25] },
+    { bass: 174.61, mel: [698.46, 880.00, 1046.5, 880.00] },
+    { bass: 196.00, mel: [783.99, 987.77, 783.99, 587.33] },
+    { bass: 220.00, mel: [880.00, 659.25, 523.25, 659.25] },
+  ] },
+  // もじめいろ：わくわく冒険（短調寄り）
+  adventure: { beat: 0.36, drums: true, stab: false, mvol: 0.06, bars: [
+    { bass: 110.00, mel: [440.00, 523.25, 659.25, 523.25] },
+    { bass:  98.00, mel: [392.00, 493.88, 587.33, 493.88] },
+    { bass: 130.81, mel: [523.25, 622.25, 783.99, 622.25] },
+    { bass: 146.83, mel: [587.33, 440.00, 349.23, 440.00] },
+  ] },
+};
 
 function _bgmNote(freq, t0, dur, vol, type) {
   const osc = AC.createOscillator(), g = AC.createGain();
@@ -358,21 +397,60 @@ function _bgmNote(freq, t0, dur, vol, type) {
   osc.connect(g); g.connect(bgmGain); osc.start(t0); osc.stop(t0 + dur + 0.05);
 }
 
+// キック：サイン波の急降下（150→45Hz）。ポップ/冒険トラックの土台。
+function _bgmKick(t0) {
+  const osc = AC.createOscillator(), g = AC.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(150, t0);
+  osc.frequency.exponentialRampToValueAtTime(45, t0 + 0.11);
+  g.gain.setValueAtTime(0.22, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.13);
+  osc.connect(g); g.connect(bgmGain); osc.start(t0); osc.stop(t0 + 0.16);
+}
+
+// ハット：短いノイズ（バッファは初回生成して使い回し）
+let _noiseBuf = null;
+function _bgmHat(t0, vol) {
+  try {
+    if (!_noiseBuf) {
+      const len = Math.max(1, Math.floor(AC.sampleRate * 0.05));
+      _noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      const ch = _noiseBuf.getChannelData(0);
+      for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / ch.length);
+    }
+    const src = AC.createBufferSource(); src.buffer = _noiseBuf;
+    const g = AC.createGain();
+    g.gain.setValueAtTime(vol || 0.05, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+    src.connect(g); g.connect(bgmGain); src.start(t0); src.stop(t0 + 0.06);
+  } catch (_) {}
+}
+
 // 先読みスケジューラ：タイマーで少し先の音を予約し続ける（タブが裏でも破綻しにくい）
 function _bgmSchedule() {
   if (!audioReady || !_bgmWanted) return;
   const ahead = 0.7;
   while (_bgmNextTime < AC.currentTime + ahead) {
-    const bar = _BGM_BARS[Math.floor(_bgmStep / 4) % _BGM_BARS.length];
+    const tr = _BGM_TRACKS[_bgmTrack] || _BGM_TRACKS.home;
+    const BEAT = tr.beat;
+    const bar = tr.bars[Math.floor(_bgmStep / 4) % tr.bars.length];
     const beatInBar = _bgmStep % 4;
-    if (beatInBar === 0) _bgmNote(bar.bass, _bgmNextTime, _BEAT * 3.6, 0.16, 'triangle');       // ベース（小節頭・長め）
-    if (beatInBar === 0 || beatInBar === 2) _bgmNote(bar.bass * 2, _bgmNextTime, _BEAT * 0.9, 0.05, 'sine'); // 薄いオクターブ
-    // メロディ（1拍おきに、候補から順に）
-    if (beatInBar % 2 === 1) {
-      const note = bar.mel[Math.floor(_bgmStep / 2) % bar.mel.length];
-      _bgmNote(note, _bgmNextTime, _BEAT * 1.1, 0.06, 'triangle');
+    if (beatInBar === 0) _bgmNote(bar.bass, _bgmNextTime, BEAT * 3.6, 0.15, 'triangle');
+    if (beatInBar === 0 || beatInBar === 2) _bgmNote(bar.bass * 2, _bgmNextTime, BEAT * 0.9, 0.045, 'sine');
+    // メロディ：拍ごと（トラックのmel配列を循環）
+    const note = bar.mel[beatInBar % bar.mel.length];
+    if (note) _bgmNote(note, _bgmNextTime, BEAT * 1.05, tr.mvol, 'triangle');
+    // 裏拍スタブ（ポップ）：和音の5度/オクターブを裏で短く
+    if (tr.stab) {
+      _bgmNote(bar.bass * 3, _bgmNextTime + BEAT * 0.5, BEAT * 0.28, 0.035, 'square');
+      _bgmNote(bar.bass * 4, _bgmNextTime + BEAT * 0.5, BEAT * 0.28, 0.025, 'square');
     }
-    _bgmNextTime += _BEAT;
+    // ドラム
+    if (tr.drums) {
+      if (beatInBar === 0 || beatInBar === 2) _bgmKick(_bgmNextTime);
+      _bgmHat(_bgmNextTime + (tr.stab ? BEAT * 0.5 : 0), 0.045);
+    }
+    _bgmNextTime += BEAT;
     _bgmStep++;
   }
   _bgmTimer = setTimeout(_bgmSchedule, 200);
@@ -389,6 +467,8 @@ function stopBgm() { _bgmWanted = false; if (_bgmTimer) { clearTimeout(_bgmTimer
 function isBgmOn() { return _bgmWanted; }
 function setBgmVolume(v) { bgmVolume = Math.max(0, Math.min(1, v)); if (bgmGain) bgmGain.gain.value = bgmVolume; }
 function getBgmVolume() { return bgmVolume; }
+// トラック切替：曲中でも次の拍から新トラックに（stepを0に戻し小節頭から）
+function setBgmTrack(name) { if (_BGM_TRACKS[name] && _bgmTrack !== name) { _bgmTrack = name; _bgmStep = 0; } }
 
 /* ===== core/speech.js ===== */
 // core/speech.js — Web Speech API (speechSynthesis) ラッパ。ja-JP・rate≈0.95。
@@ -1382,13 +1462,14 @@ class W1NazoriHira extends GameBase {
 
     this.strokes = (question.data.strokes || []).map((d) => {
       const poly = buildScreenPoly(d, scale, offsetX, offsetY);
-      return { poly, points: evenPoints(poly, SCREEN_SPACING), duration: Math.max(0.5, Math.min(1.3, poly.total / DEMO_PX_PER_SEC)) };
+      return { poly, points: evenPoints(poly, SCREEN_SPACING), duration: Math.max(0.9, Math.min(1.3, poly.total / DEMO_PX_PER_SEC)) };
     });
 
     this.R = params.toleranceR || 26;
     this.strokeIndex = 0; this.cursor = 0; this.trail = [];
     this.mistakes = 0; this._strayCount = 0; this.tracing = false;
     this.state = 'demo'; this.demoT = 0; this._demoStarted = false;
+    this._introDur = 1.9;   // 「し」「と かくよ」を言い切る音声時間。この間は手本アニメを待機（音声とアニメの直列化）
     // 文字の音を強調：まず「し」だけをはっきり、続けて「と かくよ」を（前の発話を止めずに）繋げる
     this._speak(this.kana);
     this._speak('と かくよ', { interrupt: false });
@@ -1401,13 +1482,19 @@ class W1NazoriHira extends GameBase {
   update(dt) {
     if (this.state !== 'demo') return;
     const s = this.strokes[this.strokeIndex]; if (!s) return;
-    if (!this._demoStarted) { this._demoStarted = true; this._speak(COUNT_WORDS[this.strokeIndex] || 'いち', { interrupt: false }); }
     this.demoT += dt;
+    if (!this._demoStarted) {
+      if (this.demoT < this._introDur) return;   // イントロ中：読み上げを言い切るまでアニメ待機
+      this._demoStarted = true; this.demoT = 0;
+      this._speakStrokeStart();                   // 「いち」（割り込み＝直前音声の残りがあっても被らない）
+      return;
+    }
     if (this.demoT >= s.duration) {
       this.strokeIndex++;
       if (this.strokeIndex >= this.strokes.length) {
         this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = [];
-        this._speak('なぞってみよう');
+        this._speak(this.kana);                                   // なぞる直前にもう一度この字を読み上げ
+        this._speak('を なぞってみよう', { interrupt: false });
       } else { this.demoT = 0; this._speakStrokeStart(); }
     }
   }
@@ -1421,7 +1508,13 @@ class W1NazoriHira extends GameBase {
     if (this.state === 'demo') {
       for (let i = 0; i < this.strokeIndex; i++) this._drawDone(ctx, this.strokes[i]);
       const cur = this.strokes[this.strokeIndex];
-      if (cur) {
+      if (cur && !this._demoStarted) {
+        // イントロ中：1画目の開始点をやさしく点滅させて待つ（アニメはまだ）
+        const p0 = cur.poly.pts[0];
+        const a = 0.5 + 0.5 * Math.sin(this.demoT * 5);
+        ctx.save(); ctx.fillStyle = `rgba(255,138,92,${(0.4 + 0.5 * a).toFixed(2)})`;
+        ctx.beginPath(); ctx.arc(p0.x, p0.y, 13, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+      } else if (cur) {
         const upTo = (this.demoT / cur.duration) * cur.poly.total;
         const pts = partialPoints(cur.poly, upTo);
         ctx.save(); ctx.strokeStyle = '#ff8a5c'; ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -1449,7 +1542,7 @@ class W1NazoriHira extends GameBase {
   _drawFinger(ctx, x, y) { ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.strokeStyle = '#2b3a67'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore(); }
 
   onPointerDown(x, y) {
-    if (this.state === 'demo') { this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = []; this._speak('なぞってみよう'); }
+    if (this.state === 'demo') { this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = []; this._speak(this.kana); this._speak('を なぞってみよう', { interrupt: false }); }
     if (this.state !== 'trace') return;
     this.tracing = true; this.trail = [{ x, y }];
     this._advanceCursor(x, y);
@@ -1953,15 +2046,14 @@ class G1Anagram extends GameBase {
 }
 
 /* ===== games/g2-maze.js ===== */
-// games/g2-maze.js — 【G2】もじめいろ。指でなぞって進む迷路。分岐3箇所で
-// 「正しい形」vs「まちがい形（鏡文字 or にてる別の字）」を提示し、正しい方へ進めばゴール。
-// ・道はエッジグラフ（本線＋各分岐のハズレ袋小路）。カーソルはW1同様の寛容な追従（前進/後退可）。
-// ・ハズレの終端に着いたら優しく戻す（ミスカウント）。音声で「つぎは『し』だよ」と目標を告げる。
-// ・まちがい形：50%で鏡文字（KanjiVGストロークをx反転＝新データ不要で正確）、50%でにてる字（confusables）。
+// games/g2-maze.js — 【G2】もじめいろ。ことば（2〜4文字）の字を分岐で1つずつ集めながらゴールを目指す。
+// ・分岐ごとに「正しい形」vs「まちがい形（鏡文字 or にてる別の字）」。正しい方だけが先へ続く。
+// ・正解ルートの字をつなぐと1つの ことば になり、ゴールで絵カード（絵文字＋単語）を披露＆読み上げ。
+// ・迷路の形は毎回ランダム生成（分岐位置・上下・曲がり・袋小路の向きにジッター）＝同じパターンにならない。
+// ・道はエッジグラフ（E0→F1→C1→…→Cn→GOAL、各Fkにハズレ Wk）。カーソルはW1同様の寛容な窓式追従。
 
 const R = 30;                 // 追従許容半径
 const CORRIDOR = 40;          // 道の太さ
-const FORKS = 3;
 
 function densify(pts, spacing = 10) {
   const out = [pts[0]];
@@ -1974,43 +2066,64 @@ function densify(pts, spacing = 10) {
   return out;
 }
 
-// 迷路の形（正規化座標）。本線: E0→(F1)→C1→(F2)→C2→(F3)→C3→GOAL。各Fiにハズレ Wi（袋小路）。
-function buildGeometry(W, H) {
-  const P = (x, y) => ({ x: W * x, y: H * y });
-  const edges = [
-    { id: 'E0', from: 'S',  to: 'F1', pts: [P(.08, .60), P(.24, .60)] },
-    { id: 'C1', from: 'F1', to: 'F2', pts: [P(.24, .60), P(.24, .32), P(.44, .32)], correct: true },
-    { id: 'W1', from: 'F1', to: 'D1', pts: [P(.24, .60), P(.24, .86), P(.40, .86)], correct: false },
-    { id: 'C2', from: 'F2', to: 'F3', pts: [P(.44, .32), P(.62, .32), P(.62, .60)], correct: true },
-    { id: 'W2', from: 'F2', to: 'D2', pts: [P(.44, .32), P(.52, .14), P(.68, .14)], correct: false },
-    { id: 'C3', from: 'F3', to: 'G',  pts: [P(.62, .60), P(.80, .60), P(.80, .36), P(.92, .36)], correct: true },
-    { id: 'W3', from: 'F3', to: 'D3', pts: [P(.62, .60), P(.62, .86), P(.78, .86)], correct: false },
-  ].map(e => ({ ...e, pts: densify(e.pts) }));
-  const forks = {
-    F1: { correct: 'C1', wrong: 'W1' },
-    F2: { correct: 'C2', wrong: 'W2' },
-    F3: { correct: 'C3', wrong: 'W3' },
-  };
-  return { edges, forks, forkOrder: ['F1', 'F2', 'F3'] };
+const rr = (a, b) => a + Math.random() * (b - a);
+const SMALLS = /[っゃゅょ]/;
+
+// お題の ことば：2〜4文字・基本かなのみ（迷路の分岐数＝文字数になる）
+function pickWord() {
+  const cands = VOCAB_HIRA.filter(x => x.w.length >= 2 && x.w.length <= 4 && /^[ぁ-ん]+$/.test(x.w) && !SMALLS.test(x.w));
+  return cands[Math.floor(Math.random() * cands.length)];
 }
 
-function pickTargets() {
-  // ひらがな・カタカナ混合で3文字（にてる字対応表にある字を優先＝間違い形のバリエーション確保）
-  const pool = [];
-  for (const k of Object.keys(HIRA_CONFUSE)) pool.push({ kana: k, pool: 'hiragana' });
-  for (const k of Object.keys(KATA_CONFUSE)) pool.push({ kana: k, pool: 'katakana' });
-  const out = [];
-  const used = new Set();
-  while (out.length < FORKS && pool.length) {
-    const i = Math.floor(Math.random() * pool.length);
-    const t = pool.splice(i, 1)[0];
-    if (used.has(t.kana)) continue;
-    used.add(t.kana);
-    const conf = t.pool === 'hiragana' ? HIRA_CONFUSE[t.kana] : KATA_CONFUSE[t.kana];
-    const useMirror = Math.random() < 0.5 || !conf;
-    out.push({ ...t, wrongKind: useMirror ? 'mirror' : 'confuse', wrongKana: useMirror ? t.kana : conf });
+// 迷路の形を毎回ランダム生成。バンド y∈[0.30,0.86]、x∈[0.07,0.90]。
+// 分岐Fkから：正解枝Ck＝縦（ジッター付きレーンへ）→横で次のFk+1（最終はGOAL）、ハズレWk＝逆側レーンへ落ちて袋小路。
+function buildGeometry(W, H, forks) {
+  const yMin = 0.30, yMax = 0.86;
+  const clampY = (v) => Math.max(yMin, Math.min(yMax, v));
+  const P = (x, y) => ({ x: W * x, y: H * y });
+  const edges = [];
+  const forkMap = {};
+  const forkOrder = [];
+
+  const x0 = rr(0.06, 0.09);
+  let fy = rr(0.45, 0.70);                       // スタートの高さもランダム
+  let fx = rr(0.19, 0.24);
+  edges.push({ id: 'E0', from: 'S', to: 'F1', pts: [P(x0, fy), P((x0 + fx) / 2, clampY(fy + rr(-0.06, 0.06))), P(fx, fy)] });
+
+  const stepX = (0.90 - fx) / forks;               // 残り幅を分岐数で分割
+  for (let k = 1; k <= forks; k++) {
+    const fid = `F${k}`;
+    forkOrder.push(fid);
+    const dir = Math.random() < 0.5 ? -1 : 1;      // 正解が上か下かは毎回ランダム
+    const laneC = clampY(fy + dir * rr(0.20, 0.30));
+    const laneW = clampY(fy - dir * rr(0.18, 0.28));
+    const nx = Math.min(0.90, fx + stepX * rr(0.85, 1.05));
+    const isLast = k === forks;
+    // 正解枝：縦→横（最後の分岐はGOALへ、途中に軽いジッター曲げ）
+    const cPts = [P(fx, fy), P(fx, laneC)];
+    if (!isLast) {
+      if (Math.random() < 0.5) cPts.push(P((fx + nx) / 2, clampY(laneC + rr(-0.05, 0.05))));
+      cPts.push(P(nx, laneC));
+    } else {
+      cPts.push(P(rr(0.86, 0.90), laneC));
+    }
+    edges.push({ id: `C${k}`, from: fid, to: isLast ? 'G' : `F${k + 1}`, pts: cPts, correct: true });
+    // ハズレ枝：逆レーンに落ちて短い袋小路（尻尾の向きもランダム）
+    const tail = rr(0.05, 0.09) * (Math.random() < 0.5 ? 1 : -1);
+    edges.push({ id: `W${k}`, from: fid, to: `D${k}`, pts: [P(fx, fy), P(fx, laneW), P(Math.min(0.9, Math.max(0.08, fx + Math.abs(tail))), clampY(laneW + tail * 0.5))], correct: false });
+    forkMap[fid] = { correct: `C${k}`, wrong: `W${k}` };
+    fx = nx; fy = laneC;
   }
-  return out;
+  return { edges: edges.map(e => ({ ...e, pts: densify(e.pts) })), forks: forkMap, forkOrder };
+}
+
+// ことばの各文字 → 分岐のお題（まちがい形は 50% 鏡文字／にてる字があれば 50% でそれ）
+function targetsFromWord(word) {
+  return [...word].map(kana => {
+    const conf = HIRA_CONFUSE[kana];
+    const useMirror = Math.random() < 0.5 || !conf;
+    return { kana, pool: 'hiragana', wrongKind: useMirror ? 'mirror' : 'confuse', wrongKana: useMirror ? kana : conf };
+  });
 }
 
 // KanjiVGストロークから字をミニ描画。mirror=true で左右反転（x' = vbW - x）。
@@ -2033,15 +2146,16 @@ function drawKana(kana, pool, cx, cy, size, mirror, color) {
 class G2Maze extends GameBase {
   init(ctx2, services) {
     this.services = services || {};
-    this.geo = buildGeometry(view.w, view.h);
-    this.targets = pickTargets();                       // forkOrder に対応
+    this.word = pickWord();                             // 正解ルートで完成する ことば
+    this.targets = targetsFromWord(this.word.w);        // forkOrder に対応（分岐数＝文字数）
+    this.geo = buildGeometry(view.w, view.h, this.targets.length);
+    this.collected = [];                                // 集めた字
     this.pos = { kind: 'edge', edgeId: 'E0', idx: 0 };  // kind: edge | fork
-    this.trail = [];                                    // 通過済み {edgeId, uptoIdx} の集合（描画用）
     this.progress = {};                                 // edgeId → 最深到達idx
     this.forksPassed = 0; this.mistakes = 0; this.itemsPracticed = [];
     this.done = false; this.tracing = false;
-    this._announcedFork = null; this._fxT = 0; this._msg = null;
-    this._speak('めいろ すたーと！ ゆびで なぞって すすもう');
+    this._announcedFork = null; this._msg = null; this._goalT = 0;
+    this._speak('もじを あつめて ゴールを めざそう！');
   }
 
   _speak(t, o) { const s = this.services.speech; if (s && s.speak) s.speak(t, o); }
@@ -2049,13 +2163,16 @@ class G2Maze extends GameBase {
   _edge(id) { return this.geo.edges.find(e => e.id === id); }
   _forkTarget(forkId) { return this.targets[this.geo.forkOrder.indexOf(forkId)]; }
 
-  update(dt) { if (this._msg) { this._msg.t += dt; if (this._msg.t > 1.6) this._msg = null; } }
+  update(dt) {
+    if (this._msg) { this._msg.t += dt; if (this._msg.t > 1.6) this._msg = null; }
+    if (this.done) this._goalT += dt;
+  }
 
   _announce(forkId) {
     if (this._announcedFork === forkId) return;
     this._announcedFork = forkId;
     const t = this._forkTarget(forkId);
-    this._speak(`つぎは 「${t.kana}」 だよ！ ただしい かたちへ すすもう`);
+    this._speak(`つぎは 「${t.kana}」 だよ！`);
   }
 
   onPointerDown(x, y) { this.tracing = true; this._advance(x, y); }
@@ -2065,22 +2182,25 @@ class G2Maze extends GameBase {
   _advance(x, y) {
     if (this.done) return;
     if (this.pos.kind === 'fork') {
+      // 両枝の入口候補（各枝の先頭1〜3点）から「指に最も近い点」を選ぶ。
+      // 固定順で判定すると分岐直後の重なり領域で意図しない枝に吸い付くため、必ず最近傍で決める。
       const fk = this.geo.forks[this.pos.forkId];
+      let best = null;
       for (const eid of [fk.correct, fk.wrong]) {
         const e = this._edge(eid);
         for (let k = 1; k <= 3 && k < e.pts.length; k++) {
-          if (Math.hypot(x - e.pts[k].x, y - e.pts[k].y) <= R) {
-            this.pos = { kind: 'edge', edgeId: eid, idx: k };
-            this.progress[eid] = Math.max(this.progress[eid] || 0, k);
-            return;
-          }
+          const d = Math.hypot(x - e.pts[k].x, y - e.pts[k].y);
+          if (d <= R && (!best || d < best.d)) best = { eid, k, d };
         }
+      }
+      if (best) {
+        this.pos = { kind: 'edge', edgeId: best.eid, idx: best.k };
+        this.progress[best.eid] = Math.max(this.progress[best.eid] || 0, best.k);
       }
       return;
     }
     const e = this._edge(this.pos.edgeId);
-    // カーソル更新：現在idxの前後K点の窓の中で「指に最も近い点」へ移動（1回の呼び出しで1回だけ更新＝振動しない）。
-    // 前進も後退も自然にできる。R より遠ければ動かない（道から外れた指は無視）。
+    // 窓式カーソル：現在idxの前後K点で指に最も近い点へ（前進も後退も自然・振動しない）
     const K = 4;
     let bestK = this.pos.idx, bestD = Infinity;
     for (let k = Math.max(0, this.pos.idx - K); k <= Math.min(e.pts.length - 1, this.pos.idx + K); k++) {
@@ -2091,24 +2211,29 @@ class G2Maze extends GameBase {
     this.progress[e.id] = Math.max(this.progress[e.id] || 0, this.pos.idx);
 
     if (this.pos.idx <= 0 && e.from.startsWith('F')) {
-      // 分岐まで戻った → 選び直し
       this.pos = { kind: 'fork', forkId: e.from };
       return;
     }
     if (this.pos.idx >= e.pts.length - 1) {
-      // エッジ終端に到達
       if (e.to === 'G') {
-        if (e.correct) { this.forksPassed++; this.itemsPracticed.push(this._forkTarget(e.from).kana); }
-        this.done = true; this._sfx('sfxSparkle'); this._speak('ゴール！ めいろ だいせいこう！'); return;
+        if (e.correct) { this.forksPassed++; const t = this._forkTarget(e.from); this.collected.push(t.kana); this.itemsPracticed.push(t.kana); }
+        this.done = true; this._sfx('sfxSparkle');
+        this._speak(`ゴール！ ${this.word.w}、かんせい！`);
+        return;
       }
       if (e.to.startsWith('F')) {
-        if (e.correct) { this.forksPassed++; this.itemsPracticed.push(this._forkTarget(e.from).kana); this._sfx('sfxCorrect'); }
+        if (e.correct) {
+          this.forksPassed++;
+          const t = this._forkTarget(e.from);
+          this.collected.push(t.kana); this.itemsPracticed.push(t.kana);
+          this._sfx('sfxCorrect');
+          this._speak(`「${t.kana}」 げっと！`, { interrupt: false });
+        }
         this.pos = { kind: 'fork', forkId: e.to };
         this._announce(e.to);
         return;
       }
       if (e.to.startsWith('D')) {
-        // ハズレ袋小路 → 優しく分岐へ戻す
         this.mistakes++;
         this._sfx('sfxWrong');
         this._msg = { text: 'あれれ、こっちは ちがう じ！', t: 0 };
@@ -2118,10 +2243,10 @@ class G2Maze extends GameBase {
       }
     }
   }
+
   _labelPosFor(edgeId) {
     const e = this._edge(edgeId);
     const p = e.pts[Math.min(8, e.pts.length - 1)];
-    // ラベルは分岐直後の点から、進行方向の外側に少し出す
     const p0 = e.pts[0];
     const dx = p.x - p0.x, dy = p.y - p0.y, len = Math.hypot(dx, dy) || 1;
     return { x: p.x + (dx / len) * 22, y: p.y + (dy / len) * 22 };
@@ -2129,7 +2254,7 @@ class G2Maze extends GameBase {
 
   render() {
     const W = view.w, H = view.h;
-    // 道（全エッジ：下地→通過分を色付け）
+    // 道（下地→通過分）
     for (const e of this.geo.edges) {
       ctx.save(); ctx.strokeStyle = '#f5efdf'; ctx.lineWidth = CORRIDOR; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
       this._poly(e.pts); ctx.stroke();
@@ -2148,16 +2273,16 @@ class G2Maze extends GameBase {
     // スタート/ゴール
     const s0 = this._edge('E0').pts[0];
     label('🐣', s0.x - 26, s0.y, { size: 30 });
-    const gEdge = this._edge('C3'); const gp = gEdge.pts[gEdge.pts.length - 1];
-    label('🥚', gp.x + 26, gp.y, { size: 32 });
-    label('ゴール', gp.x + 26, gp.y + 30, { size: 14, color: '#2b3a67', weight: 700 });
-    // 分岐の文字（正しい形＝正解エッジ側、まちがい形＝ハズレ側）
+    const gEdge = this._edge(`C${this.targets.length}`); const gp = gEdge.pts[gEdge.pts.length - 1];
+    label('🥚', gp.x + 24, gp.y, { size: 32 });
+    label('ゴール', gp.x + 24, gp.y + 28, { size: 13, color: '#2b3a67', weight: 700 });
+    // 分岐の字（正しい形＝正解エッジ側、まちがい形＝ハズレ側）
     this.geo.forkOrder.forEach((fid, i) => {
       const t = this.targets[i];
       const fk = this.geo.forks[fid];
       const cp = this._labelPosFor(fk.correct);
       const wp = this._labelPosFor(fk.wrong);
-      const size = Math.min(W, H) * 0.11;
+      const size = Math.min(W, H) * 0.105;
       this._badge(cp.x, cp.y, size);
       drawKana(t.kana, t.pool, cp.x, cp.y, size * 0.72, false, '#2b3a67');
       this._badge(wp.x, wp.y, size);
@@ -2168,21 +2293,53 @@ class G2Maze extends GameBase {
     const cur = this._curPoint();
     ctx.save(); ctx.fillStyle = 'rgba(255,197,58,0.95)'; ctx.beginPath(); ctx.arc(cur.x, cur.y, 13, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke(); ctx.restore();
-    // お題表示（現在の分岐 or ゴール文言）
-    if (this.done) {
-      label('ゴール！ 🎉', W / 2, H * 0.12, { size: Math.min(W * 0.05, 30), color: '#2b3a67', weight: 800 });
-    } else {
-      const fid = this.pos.kind === 'fork' ? this.pos.forkId : null;
-      const nextFork = fid || this._nextForkAhead();
-      if (nextFork) {
-        const t = this._forkTarget(nextFork);
-        label(`つぎは 「${t.kana}」！`, W / 2, H * 0.12, { size: Math.min(W * 0.045, 26), color: '#2b3a67', weight: 800 });
+    // 上部：お題＋あつめた字（？ボックス）
+    if (!this.done) {
+      const fid = this.pos.kind === 'fork' ? this.pos.forkId : this._nextForkAhead();
+      if (fid) {
+        const t = this._forkTarget(fid);
+        label(`つぎは 「${t.kana}」！`, W / 2, H * 0.115, { size: Math.min(W * 0.042, 24), color: '#2b3a67', weight: 800 });
       }
     }
+    this._renderCollected(W, H);
     if (this._msg) {
       const a = Math.max(0, 1 - this._msg.t / 1.6);
-      label(this._msg.text, W / 2, H * 0.19, { size: 20, color: `rgba(200,70,60,${a.toFixed(2)})`, weight: 800 });
+      label(this._msg.text, W / 2, H * 0.245, { size: 19, color: `rgba(200,70,60,${a.toFixed(2)})`, weight: 800 });
     }
+    // ゴール演出：ことばの絵カード
+    if (this.done) this._renderGoalCard(W, H);
+  }
+
+  _renderCollected(W, H) {
+    // 「あつめた じ」ボックス列：未取得は ？
+    const n = this.targets.length;
+    const s = Math.min(W * 0.055, H * 0.075, 34);
+    const gap = s * 0.25;
+    const total = n * s + (n - 1) * gap;
+    let x = (W - total) / 2;                          // 上部中央（お題の直下・通路帯 y≥0.30H と被らない）
+    const y = H * 0.165;
+    for (let i = 0; i < n; i++) {
+      ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.9)'; ctx.strokeStyle = i < this.collected.length ? '#57c06a' : '#c9d5ea'; ctx.lineWidth = 3;
+      rrPath(x, y, s, s, 8); ctx.fill(); ctx.stroke(); ctx.restore();
+      label(i < this.collected.length ? this.collected[i] : '？', x + s / 2, y + s / 2, { size: s * 0.6, color: i < this.collected.length ? '#2b3a67' : '#a6b2c8', weight: 800 });
+      x += s + gap;
+    }
+  }
+
+  _renderGoalCard(W, H) {
+    const t = Math.min(1, this._goalT / 0.35);
+    const ease = 1 - Math.pow(1 - t, 3);
+    ctx.save(); ctx.fillStyle = `rgba(255,255,255,${(0.55 * ease).toFixed(2)})`; ctx.fillRect(0, 0, W, H); ctx.restore();
+    const bw = Math.min(W * 0.6, 420) * (0.7 + 0.3 * ease), bh = Math.min(H * 0.52, 300) * (0.7 + 0.3 * ease);
+    const bx = (W - bw) / 2, by = (H - bh) / 2;
+    ctx.save(); ctx.globalAlpha = ease;
+    ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#57c06a'; ctx.lineWidth = 5;
+    rrPath(bx, by, bw, bh, 24); ctx.fill(); ctx.stroke();
+    label(this.word.e, W / 2, by + bh * 0.34, { size: bh * 0.34 });
+    label(this.word.w, W / 2, by + bh * 0.66, { size: Math.min(bh * 0.17, bw * 0.9 / Math.max(2, this.word.w.length)), color: '#2b3a67', weight: 800 });
+    label('もじを つないだら できた！ 🎉', W / 2, by + bh * 0.86, { size: Math.min(bh * 0.075, 17), color: '#2b3a67', weight: 700 });
+    ctx.restore();
+    drawGao(bx + bw * 0.06, by - 8, Math.min(W * 0.05, 38), 'happy');
   }
 
   _nextForkAhead() {
@@ -2250,24 +2407,46 @@ function startLoop() { if (_running) return; _running = true; _last = 0; _acc = 
 function stopLoop() { _running = false; }
 
 /* ===== scenes/title.js ===== */
-// scenes/title.js — 起動画面。「タップしてスタート」。ここで音声アンロック（input.js が実行）→ home へ。
+// scenes/title.js — 起動画面。ここで音声アンロック（input.js 経由）→ home へ。
+// タイトルは1文字ずつ「文字数×サイズから計算した位置」に描く（固定オフセット禁止＝どのサイズでも重ならない）。
+
+const TITLE_CHARS = [...'もじざうるす'];
+const TITLE_COLORS = ['#ff8a5c', '#ffc53a', '#57c06a', '#5cc8ff', '#b58cff', '#ff9ec6'];
 
 class TitleScene {
-  enter() { this.t = 0; this.started = false; }
+  enter() { this.t = 0; this.started = false; setBgmTrack('title'); }
   update(dt) { this.t += dt; }
   render() {
     fillBg();
-    const cx = view.w / 2;
-    // タイトル
-    label('もじ', cx - 92, view.h * 0.28, { size: Math.min(view.w * 0.16, 120), color: COLORS.accent, weight: 800, shadow: 3 });
-    label('ざうるす', cx + 74, view.h * 0.28, { size: Math.min(view.w * 0.16, 120), color: '#ff8a5c', weight: 800, shadow: 3 });
+    const W = view.w, H = view.h;
+    // タイトル文字：measureText の実測幅で累積配置（フォント差・端末差があっても物理的に重ならない）
+    const n = TITLE_CHARS.length;
+    let size = Math.min((W * 0.84) / n, H * 0.2, 96);
+    let pad = size * 0.06;
+    let widths = TITLE_CHARS.map(ch => textWidth(ch, size, 800));
+    let total = widths.reduce((a, b) => a + b, 0) + pad * (n - 1);
+    const maxW = W * 0.88;
+    if (total > maxW) {                      // 実測が想定より広いフォントでも1回の縮小で必ず収める
+      const k = maxW / total;
+      size *= k; pad *= k;
+      widths = TITLE_CHARS.map(ch => textWidth(ch, size, 800));
+      total = widths.reduce((a, b) => a + b, 0) + pad * (n - 1);
+    }
+    const baseY = H * 0.22;
+    let cx = (W - total) / 2;
+    TITLE_CHARS.forEach((ch, i) => {
+      const bob = Math.sin(this.t * 2.2 + i * 0.7) * size * 0.07;
+      label(ch, cx + widths[i] / 2, baseY + bob, { size, color: TITLE_COLORS[i % TITLE_COLORS.length], weight: 800, shadow: 3 });
+      cx += widths[i] + pad;
+    });
+    label('ひらがな・カタカナで あそぼう！', W / 2, baseY + size * 0.85, { size: Math.min(W * 0.035, H * 0.045, 20), color: COLORS.ink, weight: 700 });
     // ガオ（ぴょこぴょこ）
-    const bob = Math.sin(this.t * 3) * 8;
-    drawGao(cx, view.h * 0.55 + bob, Math.min(view.w * 0.12, 78), 'happy');
+    const gbob = Math.sin(this.t * 3) * H * 0.014;
+    drawGao(W / 2, H * 0.56 + gbob, Math.min(W * 0.11, H * 0.15, 72), 'happy');
     // 「タップしてスタート」点滅
     const a = 0.55 + 0.45 * Math.sin(this.t * 4);
     ctx.save(); ctx.globalAlpha = a;
-    label('タップして スタート', cx, view.h * 0.82, { size: Math.min(view.w * 0.055, 40), color: COLORS.ink, weight: 800, shadow: 1.5 });
+    label('タップして スタート', W / 2, H * 0.84, { size: Math.min(W * 0.05, H * 0.065, 34), color: COLORS.ink, weight: 800, shadow: 1.5 });
     ctx.restore();
   }
   onPointerDown() {
@@ -2285,6 +2464,7 @@ class TitleScene {
 class HomeScene {
   enter() {
     this.t = 0;
+    setBgmTrack('home');
     this.save = loadSave();
     this.gao = new Gao({ mood: 'normal' });
     this.egg = new EggGauge({ max: STARS_PER_EGG, value: this.save.eggProgress || 0 });
@@ -2310,35 +2490,52 @@ class HomeScene {
 
   _layout() {
     const W = view.w, H = view.h;
-    this.gao.x = W * 0.055; this.gao.y = H * 0.5; this.gao.size = Math.min(W * 0.045, 34);
-    const topPad = H * 0.165;
-    // 学習6ボタンを2列×3行（広い時）or 縦積み（狭い時）
-    const wide = W >= 640;
-    const cols = wide ? 2 : 1;
-    const bw = wide ? Math.min(W * 0.4, 340) : Math.min(W * 0.82, 460);
-    const bh = wide ? Math.min(H * 0.145, 92) : Math.min(H * 0.095, 62);
-    const gapX = wide ? Math.min(W * 0.05, 40) : 0;
-    const gapY = wide ? Math.min(H * 0.032, 20) : bh * 0.2;
+    // 1) 下段（ずかん・おうちのかた）を先にアンカー
+    const sh = Math.max(36, Math.min(H * 0.1, 56));
+    const sy = H - sh - Math.max(8, H * 0.025);
+    const sw = Math.min(W * 0.34, 240);
+    const sgap = Math.min(W * 0.05, 36);
+    const sx0 = (W - (sw * 2 + sgap)) / 2;
+    this.buttons[6].setRect(sx0, sy, sw, sh); this.buttons[6].labelSize = Math.max(14, Math.min(sh * 0.45, 24));
+    this.buttons[7].setRect(sx0 + sw + sgap, sy, sw, sh); this.buttons[7].labelSize = Math.max(12, Math.min(sh * 0.4, 20));
+    // 2) 学習6ボタン：ゲージ下〜下段上の「利用可能な高さ」から逆算してはみ出しゼロに
+    const gridTop = H * 0.175;
+    const gridBottom = sy - Math.max(8, H * 0.02);
+    const availH = Math.max(60, gridBottom - gridTop);
+    const cols = (W / H > 2.1 && W >= 900) ? 3 : 2;   // 超横長のみ3列
+    const rows = Math.ceil(6 / cols);
+    const gapY = Math.max(6, Math.min(H * 0.028, 16));
+    const bh = Math.min((availH - gapY * (rows - 1)) / rows, 96);
+    const gapX = Math.min(W * 0.04, 32);
+    const bw = Math.min((W * 0.94 - gapX * (cols - 1)) / cols, 360);
     const gridW = bw * cols + gapX * (cols - 1);
     const x0 = (W - gridW) / 2;
     for (let i = 0; i < 6; i++) {
       const col = i % cols, row = Math.floor(i / cols);
-      const x = x0 + col * (bw + gapX), y = topPad + row * (bh + gapY);
-      this.buttons[i].setRect(x, y, bw, bh); this.buttons[i].labelSize = wide ? 26 : 22;
+      this.buttons[i].setRect(x0 + col * (bw + gapX), gridTop + row * (bh + gapY), bw, bh);
+      const len = Math.max(2, this._meta[i].label.replace('・', '').length);
+      this.buttons[i].labelSize = Math.max(13, Math.min(bh * 0.42, (bw * 0.9) / len));
     }
-    // 下段：ずかん・おうちのかた
-    const sw = Math.min(W * 0.32, 240), sh = Math.min(H * 0.085, 54);
-    const sy = H - sh - H * 0.028, sgap = Math.min(W * 0.06, 40);
-    const totalW = sw * 2 + sgap, sx0 = (W - totalW) / 2;
-    this.buttons[6].setRect(sx0, sy, sw, sh); this.buttons[6].labelSize = 24;
-    this.buttons[7].setRect(sx0 + sw + sgap, sy, sw, sh); this.buttons[7].labelSize = 20;
+    // 3) ガオ：ヘッダ帯の左（ゲージと重ならない位置に小さく）
+    this.gao.size = Math.min(W * 0.04, H * 0.06, 28);
+    this.gao.x = Math.max(this.gao.size + 6, W * 0.06);
+    this.gao.y = H * 0.075;
   }
 
   drawEggGauge() {
-    const W = view.w, H = view.h, bw = Math.min(W * 0.6, 460), bh = 24, x = (W - bw) / 2, y = H * 0.075;
-    label('たまごまで', x - 8, y + bh / 2, { size: 20, align: 'right', color: COLORS.ink, weight: 800 });
-    this.egg.render(x, y, bw, bh);
-    label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + bh + 20, { size: 17, color: COLORS.ink, weight: 700 });
+    const W = view.w, H = view.h;
+    const bh = Math.max(14, Math.min(24, H * 0.045));
+    const bw = Math.min(W * 0.58, 460), x = (W - bw) / 2, y = Math.max(12, H * 0.045);
+    const narrow = x < 110;   // 左にラベルを置く余白がない
+    if (narrow) {
+      label('たまごまで', W / 2, y - 2, { size: Math.min(14, bh * 0.7), color: COLORS.ink, weight: 800 });
+      this.egg.render(x, y + 8, bw, bh);
+      label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + 8 + bh + 13, { size: Math.min(14, bh * 0.65), color: COLORS.ink, weight: 700 });
+    } else {
+      label('たまごまで', x - 8, y + bh / 2, { size: Math.min(20, bh * 0.85), align: 'right', color: COLORS.ink, weight: 800 });
+      this.egg.render(x, y, bw, bh);
+      label(`${this.save.stars || 0}こ の ⭐`, W / 2, y + bh + 15, { size: Math.min(16, bh * 0.7), color: COLORS.ink, weight: 700 });
+    }
   }
 
   _layoutOverlay() {
@@ -2422,6 +2619,9 @@ class LessonScene {
     this.zukanBtn = new Button({ label: 'ずかんへ', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.ZUKAN) });
 
     this.pool = MODE_TO_POOL[this.mode];
+
+    // シーン別BGM：かく系=集中 / めいろ=冒険 / ことば系=ポップ
+    setBgmTrack(this.mode === 'maze' ? 'adventure' : (this.mode === 'write' || this.mode === 'katakana') ? 'focus' : 'pop');
 
     // 単体ミニゲームモード（しりとり／なかまあつめ）：1ゲームだけ回す
     const MINI = { shiritori: 'L1', nakama: 'L2', anagram: 'G1', maze: 'G2' };
@@ -2586,10 +2786,15 @@ class LessonScene {
     const headerText = isMiniGame
       ? (this.mode === 'shiritori' ? (this.kanaMode === 'katakana' ? 'カタカナ しりとり' : 'ひらがな しりとり') : MINI_LABEL[this.mode])
       : `${this.qIndex + 1} / ${this.queue.length} もんめ`;
-    label(headerText, view.w / 2, view.h * 0.08, { size: 22, color: COLORS.ink, weight: 700 });
-    // セッション中のほしバッジ（本ゲージへの反映はセッション終了時にまとめて）
-    label('⭐', view.w - 60, 46, { size: 30 });
-    label(String(this.sessionStars), view.w - 30, 50, { size: 24, color: COLORS.ink, weight: 800, align: 'left' });
+    if (isMiniGame) {
+      // ミニゲームはヘッダを「もどる」の右に小さく＝中央上をゲームのお題表示に開放
+      label(headerText, view.w * 0.03 + bw + 10, view.h * 0.03 + bh / 2, { size: Math.max(13, Math.min(18, bh * 0.36)), align: 'left', color: COLORS.ink, weight: 700 });
+    } else {
+      label(headerText, view.w / 2, view.h * 0.08, { size: 22, color: COLORS.ink, weight: 700 });
+    }
+    // セッション中のほしバッジ（右上のミュート/全画面アイコンと重ならない高さに）
+    label('⭐', view.w - 60, 78, { size: 30 });
+    label(String(this.sessionStars), view.w - 30, 82, { size: 24, color: COLORS.ink, weight: 800, align: 'left' });
     if (this.game) this.game.render(ctx);
     this.stars.render();
   }
@@ -2658,7 +2863,12 @@ class LessonScene {
       if (this.game) this.game.onPointerDown(x, y);
       return;
     }
-    if (this.state === 'wordcard') { if (this._wordCardT > 0.6) { sfxTap(); this._advanceAfterCard(); } return; }
+    if (this.state === 'wordcard') {
+      if (this.backBtn.hitTest(x, y)) { sfxTap(); this.backBtn.tap(); return; }
+      if (this._wordCardT > 0.6) { sfxTap(); this._advanceAfterCard(); }
+      return;
+    }
+    if (this.state === 'vocabclear') { if (this.backBtn.hitTest(x, y)) { sfxTap(); this.backBtn.tap(); } return; }
     if (this.state === 'summary') { for (const b of (this._btnRects || [])) if (b.hitTest(x, y)) { sfxTap(); b.tap(); return; } }
   }
   onPointerMove(x, y) { if (this.state === 'playing' && this.game) this.game.onPointerMove(x, y); }
@@ -2707,6 +2917,7 @@ const TAB_FILL = { dino: COLORS.btnKaku, insect: COLORS.btnKotoba, ghost: COLORS
 
 class ZukanScene {
   enter() {
+    setBgmTrack('home');
     this.save = loadSave(); this.tab = 'dino';
     this.tabButtons = CATEGORY_ORDER.map(cat => new Button({ label: CATEGORY_LABEL[cat], fill: TAB_FILL[cat], labelSize: 22, onTap: () => { this.tab = cat; } }));
     this.backBtn = new Button({ label: 'もどる', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.HOME) });
@@ -2778,6 +2989,7 @@ const GATE_SEQ = [3, 1, 5];
 
 class ParentScene {
   enter() {
+    setBgmTrack('home');
     this.state = 'gate'; this.gateProgress = [];
     this.save = loadSave(); this._confirming = false;
     this.numButtons = [];

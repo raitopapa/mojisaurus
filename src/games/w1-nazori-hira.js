@@ -38,13 +38,14 @@ class W1NazoriHira extends GameBase {
 
     this.strokes = (question.data.strokes || []).map((d) => {
       const poly = buildScreenPoly(d, scale, offsetX, offsetY);
-      return { poly, points: evenPoints(poly, SCREEN_SPACING), duration: Math.max(0.5, Math.min(1.3, poly.total / DEMO_PX_PER_SEC)) };
+      return { poly, points: evenPoints(poly, SCREEN_SPACING), duration: Math.max(0.9, Math.min(1.3, poly.total / DEMO_PX_PER_SEC)) };
     });
 
     this.R = params.toleranceR || 26;
     this.strokeIndex = 0; this.cursor = 0; this.trail = [];
     this.mistakes = 0; this._strayCount = 0; this.tracing = false;
     this.state = 'demo'; this.demoT = 0; this._demoStarted = false;
+    this._introDur = 1.9;   // 「し」「と かくよ」を言い切る音声時間。この間は手本アニメを待機（音声とアニメの直列化）
     // 文字の音を強調：まず「し」だけをはっきり、続けて「と かくよ」を（前の発話を止めずに）繋げる
     this._speak(this.kana);
     this._speak('と かくよ', { interrupt: false });
@@ -57,13 +58,19 @@ class W1NazoriHira extends GameBase {
   update(dt) {
     if (this.state !== 'demo') return;
     const s = this.strokes[this.strokeIndex]; if (!s) return;
-    if (!this._demoStarted) { this._demoStarted = true; this._speak(COUNT_WORDS[this.strokeIndex] || 'いち', { interrupt: false }); }
     this.demoT += dt;
+    if (!this._demoStarted) {
+      if (this.demoT < this._introDur) return;   // イントロ中：読み上げを言い切るまでアニメ待機
+      this._demoStarted = true; this.demoT = 0;
+      this._speakStrokeStart();                   // 「いち」（割り込み＝直前音声の残りがあっても被らない）
+      return;
+    }
     if (this.demoT >= s.duration) {
       this.strokeIndex++;
       if (this.strokeIndex >= this.strokes.length) {
         this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = [];
-        this._speak('なぞってみよう');
+        this._speak(this.kana);                                   // なぞる直前にもう一度この字を読み上げ
+        this._speak('を なぞってみよう', { interrupt: false });
       } else { this.demoT = 0; this._speakStrokeStart(); }
     }
   }
@@ -77,7 +84,13 @@ class W1NazoriHira extends GameBase {
     if (this.state === 'demo') {
       for (let i = 0; i < this.strokeIndex; i++) this._drawDone(ctx, this.strokes[i]);
       const cur = this.strokes[this.strokeIndex];
-      if (cur) {
+      if (cur && !this._demoStarted) {
+        // イントロ中：1画目の開始点をやさしく点滅させて待つ（アニメはまだ）
+        const p0 = cur.poly.pts[0];
+        const a = 0.5 + 0.5 * Math.sin(this.demoT * 5);
+        ctx.save(); ctx.fillStyle = `rgba(255,138,92,${(0.4 + 0.5 * a).toFixed(2)})`;
+        ctx.beginPath(); ctx.arc(p0.x, p0.y, 13, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+      } else if (cur) {
         const upTo = (this.demoT / cur.duration) * cur.poly.total;
         const pts = partialPoints(cur.poly, upTo);
         ctx.save(); ctx.strokeStyle = '#ff8a5c'; ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
@@ -105,7 +118,7 @@ class W1NazoriHira extends GameBase {
   _drawFinger(ctx, x, y) { ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.strokeStyle = '#2b3a67'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, 14, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.restore(); }
 
   onPointerDown(x, y) {
-    if (this.state === 'demo') { this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = []; this._speak('なぞってみよう'); }
+    if (this.state === 'demo') { this.state = 'trace'; this.strokeIndex = 0; this.cursor = 0; this.trail = []; this._speak(this.kana); this._speak('を なぞってみよう', { interrupt: false }); }
     if (this.state !== 'trace') return;
     this.tracing = true; this.trail = [{ x, y }];
     this._advanceCursor(x, y);

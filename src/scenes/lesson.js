@@ -5,7 +5,7 @@
 import { COLORS, SCENE, STARS_PER_EGG } from '../core/constants.js';
 import { view, ctx, fillBg, label, rrPath } from '../core/canvas.js';
 import { scenes } from '../core/scene-manager.js';
-import { sfxTap, sfxSparkle, sfxCorrect, sfxWrong, sfxHatch } from '../core/audio.js';
+import { sfxTap, sfxSparkle, sfxCorrect, sfxWrong, sfxHatch, setBgmTrack } from '../core/audio.js';
 import { speak } from '../core/speech.js';
 import { loadSave, updateSave } from '../core/storage.js';
 import { Button } from '../ui/button.js';
@@ -53,6 +53,9 @@ class LessonScene {
     this.zukanBtn = new Button({ label: 'ずかんへ', fill: COLORS.btnZukan, top: '#a6e2ff', labelSize: 24, onTap: () => scenes.set(SCENE.ZUKAN) });
 
     this.pool = MODE_TO_POOL[this.mode];
+
+    // シーン別BGM：かく系=集中 / めいろ=冒険 / ことば系=ポップ
+    setBgmTrack(this.mode === 'maze' ? 'adventure' : (this.mode === 'write' || this.mode === 'katakana') ? 'focus' : 'pop');
 
     // 単体ミニゲームモード（しりとり／なかまあつめ）：1ゲームだけ回す
     const MINI = { shiritori: 'L1', nakama: 'L2', anagram: 'G1', maze: 'G2' };
@@ -217,10 +220,15 @@ class LessonScene {
     const headerText = isMiniGame
       ? (this.mode === 'shiritori' ? (this.kanaMode === 'katakana' ? 'カタカナ しりとり' : 'ひらがな しりとり') : MINI_LABEL[this.mode])
       : `${this.qIndex + 1} / ${this.queue.length} もんめ`;
-    label(headerText, view.w / 2, view.h * 0.08, { size: 22, color: COLORS.ink, weight: 700 });
-    // セッション中のほしバッジ（本ゲージへの反映はセッション終了時にまとめて）
-    label('⭐', view.w - 60, 46, { size: 30 });
-    label(String(this.sessionStars), view.w - 30, 50, { size: 24, color: COLORS.ink, weight: 800, align: 'left' });
+    if (isMiniGame) {
+      // ミニゲームはヘッダを「もどる」の右に小さく＝中央上をゲームのお題表示に開放
+      label(headerText, view.w * 0.03 + bw + 10, view.h * 0.03 + bh / 2, { size: Math.max(13, Math.min(18, bh * 0.36)), align: 'left', color: COLORS.ink, weight: 700 });
+    } else {
+      label(headerText, view.w / 2, view.h * 0.08, { size: 22, color: COLORS.ink, weight: 700 });
+    }
+    // セッション中のほしバッジ（右上のミュート/全画面アイコンと重ならない高さに）
+    label('⭐', view.w - 60, 78, { size: 30 });
+    label(String(this.sessionStars), view.w - 30, 82, { size: 24, color: COLORS.ink, weight: 800, align: 'left' });
     if (this.game) this.game.render(ctx);
     this.stars.render();
   }
@@ -289,7 +297,12 @@ class LessonScene {
       if (this.game) this.game.onPointerDown(x, y);
       return;
     }
-    if (this.state === 'wordcard') { if (this._wordCardT > 0.6) { sfxTap(); this._advanceAfterCard(); } return; }
+    if (this.state === 'wordcard') {
+      if (this.backBtn.hitTest(x, y)) { sfxTap(); this.backBtn.tap(); return; }
+      if (this._wordCardT > 0.6) { sfxTap(); this._advanceAfterCard(); }
+      return;
+    }
+    if (this.state === 'vocabclear') { if (this.backBtn.hitTest(x, y)) { sfxTap(); this.backBtn.tap(); } return; }
     if (this.state === 'summary') { for (const b of (this._btnRects || [])) if (b.hitTest(x, y)) { sfxTap(); b.tap(); return; } }
   }
   onPointerMove(x, y) { if (this.state === 'playing' && this.game) this.game.onPointerMove(x, y); }

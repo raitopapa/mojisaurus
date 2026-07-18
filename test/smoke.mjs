@@ -360,6 +360,8 @@ async function partA() {
   ok(mLesson.mode === 'maze' && mLesson.state === 'playing', `もじめいろで再生中（mode=${mLesson.mode}）`);
   {
     const g = mLesson.game;
+    const n = g.targets.length;
+    ok(typeof g.word?.w === 'string' && g.word.w.length === n && n >= 2 && n <= 4, `お題のことば（${g.word && g.word.w}・${n}文字＝分岐${n}箇所）`);
     const feed = (pts) => { for (const p of pts) g.onPointerMove(p.x, p.y); };
     const edge = (id) => g.geo.edges.find(e => e.id === id);
     // E0 を最後まで
@@ -371,11 +373,12 @@ async function partA() {
     feed(edge('W1').pts);
     ok(g.mistakes === mBefore + 1, `ハズレ袋小路でミスカウント（${mBefore}→${g.mistakes}）`);
     ok(g.pos.kind === 'fork' && g.pos.forkId === 'F1', 'ハズレ後はF1分岐へ優しく戻される');
-    // 正解ルートを最後まで（C1→C2→C3）
-    for (const id of ['C1', 'C2', 'C3']) feed(edge(id).pts);
+    // 正解ルートを最後まで（C1→Cn）
+    for (let k = 1; k <= n; k++) feed(edge(`C${k}`).pts);
     g.onPointerUp();
     ok(g.isComplete(), 'もじめいろ：正解ルートでゴール到達');
-    ok(g.forksPassed === 3, `分岐3つとも正解通過（実際: ${g.forksPassed}）`);
+    ok(g.forksPassed === n, `分岐${n}つとも正解通過（実際: ${g.forksPassed}）`);
+    ok(g.collected.join('') === g.word.w, `あつめた字が ことば と一致（${g.collected.join('')}）`);
     env.step(2);
   }
   // 完了後 summary へ（vocabclear 1.6s を消化）
